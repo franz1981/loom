@@ -29,10 +29,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import jdk.internal.misc.InnocuousThread;
@@ -42,7 +44,7 @@ import jdk.internal.vm.annotation.Stable;
  * Polls file descriptors. Virtual threads invoke the poll method to park
  * until a given file descriptor is ready for I/O.
  */
-public abstract class Poller {
+public abstract class Poller implements AutoCloseable {
     private static final Pollers POLLERS;
     static {
         try {
@@ -279,6 +281,43 @@ public abstract class Poller {
         }
     }
 
+    private void customSubPollerLoop(Poller masterPoller, BooleanSupplier continuePolling,
+                                     Executor scheduler, CompletableFuture<Thread> ownerSet, CompletableFuture<?> pollerClosed) {
+        assert Thread.currentThread().isVirtual();
+        owner = Thread.currentThread();
+        ownerSet.complete(owner);
+        try {
+            int polled = 0;
+            for (;;) {
+                if (!continuePolling.getAsBoolean()) {
+                    // stop polling
+                    break;
+                }
+                if (polled == 0) {
+                    masterPoller.poll(fdVal(), 0, () -> true);  // park
+                } else {
+                    Thread.yield();
+                }
+                polled = poll(0);
+            }
+            assert !masterPoller.map.containsKey(fdVal());
+            POLLERS.customPollers.remove(scheduler);
+            // TODO from here we could still have a bunch of racy registrations to the poller's fdVal
+            //      which maybe are yet to be EPOLL_CTL_ADD/MOD, but we don't care about that
+            for (int fd : map.keySet()) {
+                wakeup(fd);
+            }
+            // once the wakeup happen (if any), it will call implDeregister harmlessly OR try again to poll
+            // but since the custom poller has been removed by POLLERS.customPollers it won't be used again
+            close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            // complete the future so that the caller can continue
+            pollerClosed.complete(null);
+        }
+    }
+
     /**
      * Returns the number I/O operations currently registered with this poller.
      */
@@ -296,6 +335,7 @@ public abstract class Poller {
      * The Pollers used for read and write events.
      */
     private static class Pollers {
+        private final ConcurrentHashMap<Executor, Poller> customPollers;
         private final PollerProvider provider;
         private final Poller.Mode pollerMode;
         private final Poller masterPoller;
@@ -322,6 +362,12 @@ public abstract class Poller {
                 }
             } else {
                 mode = provider.defaultPollerMode();
+            }
+            // custom (read) pollers it's a thing only for virtual thread pollers
+            if (mode != Mode.VTHREAD_POLLERS) {
+               customPollers  = null;
+            } else {
+               customPollers = new ConcurrentHashMap<>();
             }
 
             // vthread poller mode needs a master poller
@@ -361,6 +407,7 @@ public abstract class Poller {
                         .name("SubPoller-", 0)
                         .uncaughtExceptionHandler((t, e) -> e.printStackTrace())
                         .factory();
+                // TODO this is not great since a custom scheduler calling clinit can slip in here!
                 executor = Executors.newThreadPerTaskExecutor(factory);
                 Arrays.stream(readPollers).forEach(p -> {
                     executor.execute(() -> p.subPollerLoop(masterPoller));
@@ -413,6 +460,49 @@ public abstract class Poller {
          */
         List<Poller> writePollers() {
             return List.of(writePollers);
+        }
+
+
+        static AutoCloseable startReadPoller(Executor executor) {
+            // TODO executor shouldn't be the current one
+            Objects.requireNonNull(executor, "executor must not be null");
+            if (POLLERS.customPollers == null) {
+                return () -> {};
+            }
+            var closedPoller = new CompletableFuture<Poller>();
+            var ownerSet = new CompletableFuture<Thread>();
+            var stopPoller = new AtomicBoolean(false);
+            Poller readPoller;
+            try {
+                readPoller = POLLERS.provider.readPoller(true);
+            } catch (IOException e) {
+                e.printStackTrace();
+                return () -> {};
+            }
+            if (POLLERS.customPollers.putIfAbsent(executor, readPoller) != null){
+                try {
+                    readPoller.close();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+               throw new IllegalStateException("Executor already registered for custom read poller: " + executor);
+            }
+            executor.execute(() -> readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
+                  executor, ownerSet, closedPoller));
+            return () -> {
+                if (POLLERS.customPollers.remove(executor, readPoller)) {
+                    Thread pollerThreadOwner = ownerSet.join();
+                    stopPoller.set(true);
+                    // let's add a permits here so that the custom poller owner, regardless if parked or not, has
+                    // a chance to read the stopPoller flag and start closing itself
+                    LockSupport.unpark(pollerThreadOwner);
+                    try {
+                        closedPoller.join();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            };
         }
 
 
