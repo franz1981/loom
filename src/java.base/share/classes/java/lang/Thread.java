@@ -25,6 +25,7 @@
 
 package java.lang;
 
+import java.io.Closeable;
 import java.lang.ref.Reference;
 import java.lang.reflect.Field;
 import java.time.Duration;
@@ -48,6 +49,8 @@ import jdk.internal.vm.annotation.Hidden;
 import jdk.internal.vm.annotation.IntrinsicCandidate;
 import jdk.internal.vm.annotation.Stable;
 import sun.nio.ch.Interruptible;
+import sun.nio.ch.Poller;
+
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
@@ -1068,6 +1071,19 @@ public class Thread implements Runnable {
          */
         sealed interface OfVirtual extends Builder
                 permits ThreadBuilders.VirtualThreadBuilder {
+
+
+            /**
+             * Creates and start a new read poller for the given scheduler.<br>
+             * The scheduler *must* be still running while closing it.<br>
+             * Closing the poller is necessary to release the resources it uses.<br>
+             *
+             * @param scheduler the scheduler to use for the read poller
+             * @return a {@link Closeable} instance which can be used to close the poller
+             */
+            static Closeable startReadPoller(Executor scheduler) {
+                return Poller.startReadPoller(scheduler);
+            }
 
             @Override OfVirtual name(String name);
 

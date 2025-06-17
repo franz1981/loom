@@ -81,5 +81,11 @@ class EPollPoller extends Poller {
         }
         return n;
     }
+
+    @Override
+    public void close() throws IOException {
+        EPoll.freePollArray(address);
+        FileDispatcherImpl.closeIntFD(epfd);
+    }
 }
 

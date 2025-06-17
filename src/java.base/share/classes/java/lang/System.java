@@ -2308,6 +2308,14 @@ public final class System {
                 return VirtualThread.defaultScheduler();
             }
 
+            public Executor virtualThreadScheduler(Thread thread) {
+                if (thread instanceof VirtualThread vthread) {
+                    return vthread.scheduler();
+                } else {
+                    return null;
+                }
+            }
+
             public StackWalker newStackWalkerInstance(Set<StackWalker.Option> options,
                                                       ContinuationScope contScope,
                                                       Continuation continuation) {

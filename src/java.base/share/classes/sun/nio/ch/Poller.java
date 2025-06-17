@@ -24,17 +24,23 @@
  */
 package sun.nio.ch;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
+
+import jdk.internal.access.JavaLangAccess;
+import jdk.internal.access.SharedSecrets;
 import jdk.internal.misc.InnocuousThread;
 import jdk.internal.vm.annotation.Stable;
 
@@ -42,7 +48,9 @@ import jdk.internal.vm.annotation.Stable;
  * Polls file descriptors. Virtual threads invoke the poll method to park
  * until a given file descriptor is ready for I/O.
  */
-public abstract class Poller {
+public abstract class Poller implements Closeable {
+
+    private static final JavaLangAccess JLA = SharedSecrets.getJavaLangAccess();
     private static final Pollers POLLERS;
     static {
         try {
@@ -279,6 +287,43 @@ public abstract class Poller {
         }
     }
 
+    private void customSubPollerLoop(Poller masterPoller, BooleanSupplier stopPolling,
+                                     Executor scheduler, CompletableFuture<Thread> ownerSet, CompletableFuture<?> pollerClosed) {
+        assert Thread.currentThread().isVirtual();
+        owner = Thread.currentThread();
+        ownerSet.complete(owner);
+        try {
+            int polled = 0;
+            for (;;) {
+                if (stopPolling.getAsBoolean()) {
+                    // stop polling
+                    break;
+                }
+                if (polled == 0) {
+                    masterPoller.poll(fdVal(), 0, () -> true);  // park
+                } else {
+                    Thread.yield();
+                }
+                polled = poll(0);
+            }
+            assert !masterPoller.map.containsKey(fdVal());
+            POLLERS.customPollers.remove(scheduler);
+            // TODO from here we could still have a bunch of racy registrations to the poller's fdVal
+            //      which maybe are yet to be EPOLL_CTL_ADD/MOD, but we don't care about that
+            for (int fd : map.keySet()) {
+                wakeup(fd);
+            }
+            // once the wakeup happen (if any), it will call implDeregister harmlessly OR try again to poll
+            // but since the custom poller has been removed by POLLERS.customPollers it won't be used again
+            close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            // complete the future so that the caller can continue
+            pollerClosed.complete(null);
+        }
+    }
+
     /**
      * Returns the number I/O operations currently registered with this poller.
      */
@@ -296,6 +341,7 @@ public abstract class Poller {
      * The Pollers used for read and write events.
      */
     private static class Pollers {
+        private final ConcurrentHashMap<Executor, Poller> customPollers;
         private final PollerProvider provider;
         private final Poller.Mode pollerMode;
         private final Poller masterPoller;
@@ -322,6 +368,12 @@ public abstract class Poller {
                 }
             } else {
                 mode = provider.defaultPollerMode();
+            }
+            // custom (read) pollers it's a thing only for virtual thread pollers
+            if (mode != Mode.VTHREAD_POLLERS) {
+               customPollers  = null;
+            } else {
+               customPollers = new ConcurrentHashMap<>();
             }
 
             // vthread poller mode needs a master poller
@@ -361,6 +413,7 @@ public abstract class Poller {
                         .name("SubPoller-", 0)
                         .uncaughtExceptionHandler((t, e) -> e.printStackTrace())
                         .factory();
+                // TODO this is not great since a custom scheduler calling clinit can slip in here!
                 executor = Executors.newThreadPerTaskExecutor(factory);
                 Arrays.stream(readPollers).forEach(p -> {
                     executor.execute(() -> p.subPollerLoop(masterPoller));
@@ -389,6 +442,13 @@ public abstract class Poller {
          * Returns the read poller for the given file descriptor.
          */
         Poller readPoller(int fdVal) {
+            var scheduler = JLA.virtualThreadScheduler(Thread.currentThread());
+            if (scheduler != null && scheduler != JLA.virtualThreadDefaultScheduler()) {
+                var poller = customPollers.get(scheduler);
+                if (poller != null) {
+                    return poller;
+                }
+            }
             int index = provider.fdValToIndex(fdVal, readPollers.length);
             return readPollers[index];
         }
@@ -413,6 +473,61 @@ public abstract class Poller {
          */
         List<Poller> writePollers() {
             return List.of(writePollers);
+        }
+
+
+        Closeable startReadPoller(Executor executor) {
+            Objects.requireNonNull(executor, "executor must not be null");
+            if (customPollers == null || executor == JLA.virtualThreadDefaultScheduler()) {
+                // the default scheduler already has N read pollers, so we don't need to create a custom one
+                return () -> {};
+            }
+            var closedPoller = new CompletableFuture<Poller>();
+            var ownerSet = new CompletableFuture<Thread>();
+            var stopPoller = new AtomicBoolean(false);
+            Poller readPoller;
+            try {
+                readPoller = provider.readPoller(true);
+            } catch (IOException e) {
+                e.printStackTrace();
+                return () -> {};
+            }
+            if (customPollers.putIfAbsent(executor, readPoller) != null){
+                try {
+                    readPoller.close();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+               throw new IllegalStateException("Executor already registered for custom read poller: " + executor);
+            }
+            Thread.ofVirtual().scheduler(task -> {
+                if (stopPoller.get()) {
+                    // the shutdown sequence of the sub-poller loop keep on running on the default scheduler:
+                    // this is necessary since the carrier thread of the custom scheduler needs others
+                    // to unpark it and complete the closedPoller future
+                    JLA.virtualThreadDefaultScheduler().execute(task);
+                } else {
+                    // the custom poller is running on the custom scheduler
+                    executor.execute(task);
+                }
+            }).start(() -> {
+                readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
+                        executor, ownerSet, closedPoller);
+            });
+            return () -> {
+                if (customPollers.remove(executor, readPoller)) {
+                    Thread pollerThreadOwner = ownerSet.join();
+                    stopPoller.set(true);
+                    // let's add a permits here so that the custom poller owner, regardless if parked or not, has
+                    // a chance to read the stopPoller flag and start closing itself
+                    LockSupport.unpark(pollerThreadOwner);
+                    try {
+                        closedPoller.join();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            };
         }
 
 
@@ -469,5 +584,12 @@ public abstract class Poller {
      */
     public static List<Poller> writePollers() {
         return POLLERS.writePollers();
+    }
+
+    /**
+     * Creates and start a new read poller for the given scheduler.
+     */
+    public static Closeable startReadPoller(Executor executor) {
+        return POLLERS.startReadPoller(executor);
     }
 }
