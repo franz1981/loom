@@ -323,6 +323,9 @@ public abstract class Poller implements AutoCloseable {
         }
     }
 
+    @Override
+    public abstract void close();
+
     /**
      * Returns the number I/O operations currently registered with this poller.
      */
