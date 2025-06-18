@@ -500,8 +500,10 @@ public abstract class Poller implements Closeable {
                 }
                throw new IllegalStateException("Executor already registered for custom read poller: " + executor);
             }
-            executor.execute(() -> readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
-                  executor, ownerSet, closedPoller));
+            Thread.ofVirtual().scheduler(executor).start(() -> {
+                readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
+                        executor, ownerSet, closedPoller);
+            });
             return () -> {
                 if (customPollers.remove(executor, readPoller)) {
                     Thread pollerThreadOwner = ownerSet.join();
