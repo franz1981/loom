@@ -475,10 +475,10 @@ public abstract class Poller implements AutoCloseable {
         }
 
 
-        static AutoCloseable startReadPoller(Executor executor) {
+        AutoCloseable startReadPoller(Executor executor) {
             // TODO executor shouldn't be the current one
             Objects.requireNonNull(executor, "executor must not be null");
-            if (POLLERS.customPollers == null) {
+            if (customPollers == null) {
                 return () -> {};
             }
             var closedPoller = new CompletableFuture<Poller>();
@@ -486,12 +486,12 @@ public abstract class Poller implements AutoCloseable {
             var stopPoller = new AtomicBoolean(false);
             Poller readPoller;
             try {
-                readPoller = POLLERS.provider.readPoller(true);
+                readPoller = provider.readPoller(true);
             } catch (IOException e) {
                 e.printStackTrace();
                 return () -> {};
             }
-            if (POLLERS.customPollers.putIfAbsent(executor, readPoller) != null){
+            if (customPollers.putIfAbsent(executor, readPoller) != null){
                 try {
                     readPoller.close();
                 } catch (Exception e) {
@@ -502,7 +502,7 @@ public abstract class Poller implements AutoCloseable {
             executor.execute(() -> readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
                   executor, ownerSet, closedPoller));
             return () -> {
-                if (POLLERS.customPollers.remove(executor, readPoller)) {
+                if (customPollers.remove(executor, readPoller)) {
                     Thread pollerThreadOwner = ownerSet.join();
                     stopPoller.set(true);
                     // let's add a permits here so that the custom poller owner, regardless if parked or not, has
@@ -571,5 +571,12 @@ public abstract class Poller implements AutoCloseable {
      */
     public static List<Poller> writePollers() {
         return POLLERS.writePollers();
+    }
+
+    /**
+     * Creates and start a new read poller for the given scheduler.
+     */
+    public static AutoCloseable startReadPoller(Executor executor) {
+        return POLLERS.startReadPoller(executor);
     }
 }

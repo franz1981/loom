@@ -48,6 +48,8 @@ import jdk.internal.vm.annotation.Hidden;
 import jdk.internal.vm.annotation.IntrinsicCandidate;
 import jdk.internal.vm.annotation.Stable;
 import sun.nio.ch.Interruptible;
+import sun.nio.ch.Poller;
+
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
@@ -1068,6 +1070,11 @@ public class Thread implements Runnable {
          */
         sealed interface OfVirtual extends Builder
                 permits ThreadBuilders.VirtualThreadBuilder {
+
+
+            static AutoCloseable startReadPoller(Executor scheduler) {
+                return Poller.startReadPoller(scheduler);
+            }
 
             @Override OfVirtual name(String name);
 
