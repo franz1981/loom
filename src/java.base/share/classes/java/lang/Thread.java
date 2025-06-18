@@ -1073,6 +1073,11 @@ public class Thread implements Runnable {
                 permits ThreadBuilders.VirtualThreadBuilder {
 
 
+            /**
+             * Creates and start a new read poller for the given scheduler.<br>
+             * The scheduler *must* be still running while closing it.<br>
+             * Closing the poller is necessary to release the resources it uses.<br>
+             */
             static Closeable startReadPoller(Executor scheduler) {
                 return Poller.startReadPoller(scheduler);
             }
