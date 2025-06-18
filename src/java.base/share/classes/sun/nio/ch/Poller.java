@@ -37,6 +37,9 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
+
+import jdk.internal.access.JavaLangAccess;
+import jdk.internal.access.SharedSecrets;
 import jdk.internal.misc.InnocuousThread;
 import jdk.internal.vm.annotation.Stable;
 
@@ -45,6 +48,8 @@ import jdk.internal.vm.annotation.Stable;
  * until a given file descriptor is ready for I/O.
  */
 public abstract class Poller implements AutoCloseable {
+
+    private static final JavaLangAccess JLA = SharedSecrets.getJavaLangAccess();
     private static final Pollers POLLERS;
     static {
         try {
@@ -436,6 +441,13 @@ public abstract class Poller implements AutoCloseable {
          * Returns the read poller for the given file descriptor.
          */
         Poller readPoller(int fdVal) {
+            var scheduler = JLA.virtualThreadScheduler(Thread.currentThread());
+            if (scheduler != null && scheduler != JLA.virtualThreadDefaultScheduler()) {
+                var poller = customPollers.get(scheduler);
+                if (poller != null) {
+                    return poller;
+                }
+            }
             int index = provider.fdValToIndex(fdVal, readPollers.length);
             return readPollers[index];
         }

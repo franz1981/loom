@@ -599,6 +599,13 @@ public interface JavaLangAccess {
     void unparkVirtualThread(Thread thread);
 
     /**
+     * Returns the virtual thread scheduler for the given thread.
+     * @param thread the virtual thread
+     * @return the virtual thread scheduler or {@code null} if the thread is not a virtual thread
+     */
+    Executor virtualThreadScheduler(Thread thread);
+
+    /**
      * Returns the virtual thread default scheduler.
      */
     Executor virtualThreadDefaultScheduler();

@@ -289,6 +289,10 @@ final class VirtualThread extends BaseVirtualThread {
         }
     }
 
+    public Executor scheduler() {
+        return scheduler;
+    }
+
     /**
      * Runs or continues execution on the current thread. The virtual thread is mounted
      * on the current thread before the task runs or continues. It unmounts when the
