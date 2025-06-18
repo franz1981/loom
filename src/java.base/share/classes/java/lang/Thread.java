@@ -25,6 +25,7 @@
 
 package java.lang;
 
+import java.io.Closeable;
 import java.lang.ref.Reference;
 import java.lang.reflect.Field;
 import java.time.Duration;
@@ -1072,7 +1073,7 @@ public class Thread implements Runnable {
                 permits ThreadBuilders.VirtualThreadBuilder {
 
 
-            static AutoCloseable startReadPoller(Executor scheduler) {
+            static Closeable startReadPoller(Executor scheduler) {
                 return Poller.startReadPoller(scheduler);
             }
 

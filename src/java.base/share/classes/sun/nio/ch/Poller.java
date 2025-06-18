@@ -24,6 +24,7 @@
  */
 package sun.nio.ch;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
@@ -47,7 +48,7 @@ import jdk.internal.vm.annotation.Stable;
  * Polls file descriptors. Virtual threads invoke the poll method to park
  * until a given file descriptor is ready for I/O.
  */
-public abstract class Poller implements AutoCloseable {
+public abstract class Poller implements Closeable {
 
     private static final JavaLangAccess JLA = SharedSecrets.getJavaLangAccess();
     private static final Pollers POLLERS;
@@ -323,9 +324,6 @@ public abstract class Poller implements AutoCloseable {
         }
     }
 
-    @Override
-    public abstract void close();
-
     /**
      * Returns the number I/O operations currently registered with this poller.
      */
@@ -478,7 +476,7 @@ public abstract class Poller implements AutoCloseable {
         }
 
 
-        AutoCloseable startReadPoller(Executor executor) {
+        Closeable startReadPoller(Executor executor) {
             // TODO executor shouldn't be the current one
             Objects.requireNonNull(executor, "executor must not be null");
             if (customPollers == null) {
@@ -579,7 +577,7 @@ public abstract class Poller implements AutoCloseable {
     /**
      * Creates and start a new read poller for the given scheduler.
      */
-    public static AutoCloseable startReadPoller(Executor executor) {
+    public static Closeable startReadPoller(Executor executor) {
         return POLLERS.startReadPoller(executor);
     }
 }
