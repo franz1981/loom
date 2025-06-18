@@ -1077,6 +1077,9 @@ public class Thread implements Runnable {
              * Creates and start a new read poller for the given scheduler.<br>
              * The scheduler *must* be still running while closing it.<br>
              * Closing the poller is necessary to release the resources it uses.<br>
+             *
+             * @param scheduler the scheduler to use for the read poller
+             * @return a {@link Closeable} instance which can be used to close the poller
              */
             static Closeable startReadPoller(Executor scheduler) {
                 return Poller.startReadPoller(scheduler);
