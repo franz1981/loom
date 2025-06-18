@@ -287,7 +287,7 @@ public abstract class Poller implements Closeable {
         }
     }
 
-    private void customSubPollerLoop(Poller masterPoller, BooleanSupplier continuePolling,
+    private void customSubPollerLoop(Poller masterPoller, BooleanSupplier stopPolling,
                                      Executor scheduler, CompletableFuture<Thread> ownerSet, CompletableFuture<?> pollerClosed) {
         assert Thread.currentThread().isVirtual();
         owner = Thread.currentThread();
@@ -295,7 +295,7 @@ public abstract class Poller implements Closeable {
         try {
             int polled = 0;
             for (;;) {
-                if (!continuePolling.getAsBoolean()) {
+                if (stopPolling.getAsBoolean()) {
                     // stop polling
                     break;
                 }
