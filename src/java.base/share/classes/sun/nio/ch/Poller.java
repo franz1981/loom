@@ -477,9 +477,9 @@ public abstract class Poller implements Closeable {
 
 
         Closeable startReadPoller(Executor executor) {
-            // TODO executor shouldn't be the current one
             Objects.requireNonNull(executor, "executor must not be null");
-            if (customPollers == null) {
+            if (customPollers == null || executor == JLA.virtualThreadDefaultScheduler()) {
+                // the default scheduler already has N read pollers, so we don't need to create a custom one
                 return () -> {};
             }
             var closedPoller = new CompletableFuture<Poller>();
@@ -500,7 +500,14 @@ public abstract class Poller implements Closeable {
                 }
                throw new IllegalStateException("Executor already registered for custom read poller: " + executor);
             }
-            Thread.ofVirtual().scheduler(executor).start(() -> {
+            Thread.ofVirtual().scheduler(task -> {
+                if (stopPoller.get()) {
+                    // the shutdown sequence of the sub-poller loop keep on running on the default scheduler:
+                    // this is necessary since the carrier thread of the custom scheduler needs others
+                    // to unpark it and complete the closedPoller future
+                    JLA.virtualThreadDefaultScheduler().execute(task);
+                }
+            }).start(() -> {
                 readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
                         executor, ownerSet, closedPoller);
             });
