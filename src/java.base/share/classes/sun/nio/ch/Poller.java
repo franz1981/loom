@@ -506,6 +506,9 @@ public abstract class Poller implements Closeable {
                     // this is necessary since the carrier thread of the custom scheduler needs others
                     // to unpark it and complete the closedPoller future
                     JLA.virtualThreadDefaultScheduler().execute(task);
+                } else {
+                    // the custom poller is running on the custom scheduler
+                    executor.execute(task);
                 }
             }).start(() -> {
                 readPoller.customSubPollerLoop(POLLERS.masterPoller(), stopPoller::get,
