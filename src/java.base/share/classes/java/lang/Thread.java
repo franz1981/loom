@@ -1266,6 +1266,57 @@ public class Thread implements Runnable {
 
             @Override OfVirtual inheritInheritableThreadLocals(boolean inherit);
             @Override OfVirtual uncaughtExceptionHandler(UncaughtExceptionHandler ueh);
+
+            /**
+             * Sets the carrier affinity to round-robin mode. Each thread created by
+             * the resulting factory will be submitted to the next worker in the
+             * scheduler's pool in sequence.
+             *
+             * <p> This is a scheduling hint. Work-stealing is still permitted; the
+             * thread will be re-submitted to the target worker after each unmount
+             * so that it naturally drifts back over time.
+             *
+             * <p> This method has no effect if the scheduler is not a
+             * {@code ForkJoinPool}.
+             *
+             * @return this builder
+             */
+            OfVirtual roundRobinAffinity();
+
+            /**
+             * Sets the carrier affinity to inherit from the given thread. If the
+             * given thread is a virtual thread currently mounted on a carrier, the
+             * worker index of that carrier is used as the affinity hint for threads
+             * created by the resulting factory.
+             *
+             * <p> This is a scheduling hint. Work-stealing is still permitted; the
+             * thread will be re-submitted to the target worker after each unmount
+             * so that it naturally drifts back over time.
+             *
+             * <p> If the given thread is not a virtual thread or is not currently
+             * mounted on a carrier, this silently degrades to no affinity.
+             *
+             * @param t the thread whose carrier affinity to inherit
+             * @return this builder
+             */
+            OfVirtual inheritAffinity(Thread t);
+
+            /**
+             * Sets the carrier affinity to inherit from the calling thread at
+             * {@link ThreadFactory#newThread(Runnable) newThread} time. Each call
+             * to the factory's {@code newThread} resolves the caller's affinity
+             * index at that point.
+             *
+             * <p> This is a scheduling hint. Work-stealing is still permitted; the
+             * thread will be re-submitted to the target worker after each unmount
+             * so that it naturally drifts back over time.
+             *
+             * <p> If the calling thread has no affinity, the created thread
+             * silently gets no affinity.
+             *
+             * @return this builder
+             */
+            OfVirtual inheritAffinity();
         }
     }
 

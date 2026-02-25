@@ -104,6 +104,9 @@ final class VirtualThread extends BaseVirtualThread {
     private final Continuation cont;
     private final VThreadTask runContinuation;
 
+    // carrier affinity hint: worker index in the ForkJoinPool, or -1 for no affinity
+    final int affinityWorkerIndex;
+
     // virtual thread state, accessed by VM
     private volatile int state;
 
@@ -258,6 +261,15 @@ final class VirtualThread extends BaseVirtualThread {
                   String name,
                   int characteristics,
                   Runnable task) {
+        this(scheduler, preferredCarrier, name, characteristics, task, -1);
+    }
+
+    VirtualThread(VirtualThreadScheduler scheduler,
+                  Thread preferredCarrier,
+                  String name,
+                  int characteristics,
+                  Runnable task,
+                  int affinityWorkerIndex) {
         super(name, characteristics, /*bound*/ false);
         Objects.requireNonNull(task);
 
@@ -269,6 +281,7 @@ final class VirtualThread extends BaseVirtualThread {
         }
         this.scheduler = scheduler;
         this.cont = new VThreadContinuation(this, task);
+        this.affinityWorkerIndex = affinityWorkerIndex;
 
         if (scheduler == BUILTIN_SCHEDULER) {
             this.runContinuation = new VThreadTask(this);
@@ -420,7 +433,8 @@ final class VirtualThread extends BaseVirtualThread {
     /**
      * Submits the runContinuation task to the scheduler. For the built-in scheduler,
      * the task will be pushed to the local queue if possible, otherwise it will be
-     * pushed to an external submission queue.
+     * pushed to an external submission queue. If an affinity worker index is set and
+     * the scheduler is a ForkJoinPool, the task is submitted to that worker's queue.
      * @param retryOnOOME true to retry indefinitely if OutOfMemoryError is thrown
      * @throws RejectedExecutionException
      */
@@ -428,12 +442,14 @@ final class VirtualThread extends BaseVirtualThread {
         boolean done = false;
         while (!done) {
             try {
-                // Pin the continuation to prevent the virtual thread from unmounting
-                // when submitting a task. For the default scheduler this ensures that
-                // the carrier doesn't change when pushing a task. For other schedulers
-                // it avoids deadlock that could arise due to carriers and virtual
-                // threads contending for a lock.
-                if (currentThread().isVirtual()) {
+                if (affinityWorkerIndex >= 0 && scheduler instanceof BuiltinForkJoinPoolScheduler s) {
+                    s.submitToTargetWorker(ForkJoinTask.adapt(runContinuation), affinityWorkerIndex);
+                } else if (currentThread().isVirtual()) {
+                    // Pin the continuation to prevent the virtual thread from unmounting
+                    // when submitting a task. For the default scheduler this ensures that
+                    // the carrier doesn't change when pushing a task. For other schedulers
+                    // it avoids deadlock that could arise due to carriers and virtual
+                    // threads contending for a lock.
                     Continuation.pin();
                     try {
                         scheduler.onContinue(runContinuation);
@@ -478,6 +494,10 @@ final class VirtualThread extends BaseVirtualThread {
      */
     private void lazySubmitRunContinuation() {
         assert !currentThread().isVirtual();
+        if (affinityWorkerIndex >= 0) {
+            submitRunContinuation();
+            return;
+        }
         if (currentThread() instanceof CarrierThread ct && ct.getQueuedTaskCount() == 0) {
             try {
                 ct.getPool().lazySubmit(ForkJoinTask.adapt(runContinuation));
@@ -502,6 +522,10 @@ final class VirtualThread extends BaseVirtualThread {
      */
     private void externalSubmitRunContinuation() {
         assert !currentThread().isVirtual();
+        if (affinityWorkerIndex >= 0) {
+            submitRunContinuation();
+            return;
+        }
         if (currentThread() instanceof CarrierThread ct) {
             try {
                 ct.getPool().externalSubmit(ForkJoinTask.adapt(runContinuation));
@@ -528,7 +552,9 @@ final class VirtualThread extends BaseVirtualThread {
      */
     private void externalSubmitRunContinuationOrThrow() {
         try {
-            if (currentThread().isVirtual()) {
+            if (affinityWorkerIndex >= 0 && scheduler instanceof BuiltinForkJoinPoolScheduler s) {
+                s.submitToTargetWorker(ForkJoinTask.adapt(runContinuation), affinityWorkerIndex);
+            } else if (currentThread().isVirtual()) {
                 // Pin the continuation to prevent the virtual thread from unmounting
                 // when submitting a task. This avoids deadlock that could arise due to
                 // carriers and virtual threads contending for a lock.
@@ -1545,7 +1571,8 @@ final class VirtualThread extends BaseVirtualThread {
             Thread.UncaughtExceptionHandler handler = (t, e) -> { };
             boolean asyncMode = true; // FIFO
             super(parallelism, factory, handler, asyncMode,
-                    0, maxPoolSize, minRunnable, pool -> true, 30L, SECONDS);
+                    0, maxPoolSize, minRunnable, pool -> true, 30L, SECONDS,
+                    true /* externalQueueAffinity */);
         }
 
         @Override
@@ -1556,6 +1583,10 @@ final class VirtualThread extends BaseVirtualThread {
         @Override
         public void onContinue(VirtualThreadTask task) {
             execute(ForkJoinTask.adapt(task));
+        }
+
+        void submitToTargetWorker(ForkJoinTask<?> task, int workerIndex) {
+            submitToWorker(task, workerIndex);
         }
 
         @Override

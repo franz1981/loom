@@ -31,7 +31,9 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import jdk.internal.misc.Unsafe;
 import jdk.internal.invoke.MhUtil;
 import jdk.internal.vm.ContinuationSupport;
@@ -41,6 +43,18 @@ import jdk.internal.vm.ContinuationSupport;
  */
 class ThreadBuilders {
     private ThreadBuilders() { }
+
+    /**
+     * Resolves the worker index from the given thread. If the thread is a
+     * virtual thread with an affinity index, that index is copied.
+     * Returns -1 otherwise.
+     */
+    static int resolveWorkerIndex(Thread t) {
+        if (t instanceof VirtualThread vt) {
+            return vt.affinityWorkerIndex;
+        }
+        return -1;
+    }
 
     /**
      * Base class for Thread.Builder implementations.
@@ -209,6 +223,9 @@ class ThreadBuilders {
     static final class VirtualThreadBuilder
             extends BaseThreadBuilder implements OfVirtual {
         private Thread.VirtualThreadScheduler scheduler;
+        private boolean useRoundRobinAffinity;
+        private boolean useCallerAffinity;
+        private int inheritedAffinityWorkerIndex = -1;
 
         VirtualThreadBuilder() {
         }
@@ -234,6 +251,30 @@ class ThreadBuilders {
         @Override
         public OfVirtual uncaughtExceptionHandler(UncaughtExceptionHandler ueh) {
             setUncaughtExceptionHandler(ueh);
+            return this;
+        }
+
+        @Override
+        public OfVirtual roundRobinAffinity() {
+            this.useRoundRobinAffinity = true;
+            this.useCallerAffinity = false;
+            this.inheritedAffinityWorkerIndex = -1;
+            return this;
+        }
+
+        @Override
+        public OfVirtual inheritAffinity(Thread t) {
+            this.useRoundRobinAffinity = false;
+            this.useCallerAffinity = false;
+            this.inheritedAffinityWorkerIndex = resolveWorkerIndex(t);
+            return this;
+        }
+
+        @Override
+        public OfVirtual inheritAffinity() {
+            this.useRoundRobinAffinity = false;
+            this.useCallerAffinity = true;
+            this.inheritedAffinityWorkerIndex = -1;
             return this;
         }
 
@@ -265,7 +306,8 @@ class ThreadBuilders {
         @Override
         public ThreadFactory factory() {
             return new VirtualThreadFactory(scheduler, name(), counter(), characteristics(),
-                    uncaughtExceptionHandler());
+                    uncaughtExceptionHandler(), useRoundRobinAffinity,
+                    useCallerAffinity, inheritedAffinityWorkerIndex);
         }
     }
 
@@ -369,25 +411,70 @@ class ThreadBuilders {
      */
     private static class VirtualThreadFactory extends BaseThreadFactory {
         private final Thread.VirtualThreadScheduler scheduler;
+        private final boolean useRoundRobinAffinity;
+        private final boolean useCallerAffinity;
+        private final int inheritedAffinityWorkerIndex;
+        private final AtomicInteger roundRobinCounter;
 
         VirtualThreadFactory(Thread.VirtualThreadScheduler scheduler,
                              String name,
                              long start,
                              int characteristics,
-                             UncaughtExceptionHandler uhe) {
+                             UncaughtExceptionHandler uhe,
+                             boolean useRoundRobinAffinity,
+                             boolean useCallerAffinity,
+                             int inheritedAffinityWorkerIndex) {
             super(name, start, characteristics, uhe);
             this.scheduler = scheduler;
+            this.useRoundRobinAffinity = useRoundRobinAffinity;
+            this.useCallerAffinity = useCallerAffinity;
+            this.inheritedAffinityWorkerIndex = inheritedAffinityWorkerIndex;
+            this.roundRobinCounter = useRoundRobinAffinity ? new AtomicInteger() : null;
         }
 
         @Override
         public Thread newThread(Runnable task) {
             Objects.requireNonNull(task);
             String name = nextThreadName();
-            Thread thread = newVirtualThread(scheduler, null, name, characteristics(), task);
+            int affinityIndex = resolveAffinityIndex();
+            Thread thread = newVirtualThread(scheduler, null, name, characteristics(),
+                    task, affinityIndex);
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
                 thread.uncaughtExceptionHandler(uhe);
             return thread;
+        }
+
+        private int resolveAffinityIndex() {
+            if (useRoundRobinAffinity) {
+                ForkJoinPool pool = resolvePool();
+                if (pool != null) {
+                    int parallelism = pool.getParallelism();
+                    if (parallelism > 0) {
+                        return Math.floorMod(roundRobinCounter.getAndIncrement(), parallelism);
+                    }
+                }
+            }
+            if (useCallerAffinity) {
+                return resolveWorkerIndex(Thread.currentThread());
+            }
+            return inheritedAffinityWorkerIndex;
+        }
+
+        /**
+         * Resolves the ForkJoinPool from the scheduler. Returns the builtin
+         * scheduler pool if no scheduler is set (or is the builtin one).
+         * Returns null otherwise.
+         */
+        private ForkJoinPool resolvePool() {
+            if (scheduler == null) {
+                // null means builtin scheduler, which is a ForkJoinPool
+                var defaultScheduler = VirtualThread.defaultScheduler();
+                if (defaultScheduler instanceof ForkJoinPool pool) {
+                    return pool;
+                }
+            }
+            return null;
         }
     }
 
@@ -399,8 +486,21 @@ class ThreadBuilders {
                                            String name,
                                            int characteristics,
                                            Runnable task) {
+        return newVirtualThread(scheduler, preferredCarrier, name, characteristics, task, -1);
+    }
+
+    /**
+     * Creates a new virtual thread to run the given task with an affinity hint.
+     */
+    private static Thread newVirtualThread(Thread.VirtualThreadScheduler scheduler,
+                                           Thread preferredCarrier,
+                                           String name,
+                                           int characteristics,
+                                           Runnable task,
+                                           int affinityWorkerIndex) {
         if (ContinuationSupport.isSupported()) {
-            return new VirtualThread(scheduler, preferredCarrier, name, characteristics, task);
+            return new VirtualThread(scheduler, preferredCarrier, name, characteristics,
+                    task, affinityWorkerIndex);
         } else {
             if (scheduler != null)
                 throw new UnsupportedOperationException();

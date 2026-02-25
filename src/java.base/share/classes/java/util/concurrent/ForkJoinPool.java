@@ -1191,6 +1191,7 @@ public class ForkJoinPool extends AbstractExecutorService
         volatile int source;       // source queue id (or DROPPED)
         @jdk.internal.vm.annotation.Contended("w")
         int nsteals;               // number of steals from other queues
+        int internalQueueIndex = -1; // stable odd index in queues[] array
 
         // Support for atomic operations
         private static final Unsafe U;
@@ -1633,8 +1634,10 @@ public class ForkJoinPool extends AbstractExecutorService
     volatile long runState;              // versioned, lockable
     final long keepAlive;                // milliseconds before dropping if idle
     final long config;                   // static configuration bits
+    boolean externalQueueAffinity;       // start scan at affine external queue
     volatile long stealCount;            // collects worker nsteals
     volatile long threadIds;             // for worker thread names
+    int nextWorkerIndex;                 // next dense index for registerWorker
 
     @jdk.internal.vm.annotation.Contended("fjpctl") // segregate
     volatile long ctl;                   // main pool control
@@ -1784,6 +1787,7 @@ public class ForkJoinPool extends AbstractExecutorService
                             break;
                         }
                     }
+                    w.internalQueueIndex = id;
                     w.phase = id | phaseSeq;    // now publishable
                     if (id < n)
                         qs[id] = w;
@@ -1969,7 +1973,8 @@ public class ForkJoinPool extends AbstractExecutorService
             int fifo = (int)config & FIFO, rescans = 0, inactive = 0, taken = 0, n;
             while ((runState & STOP) == 0L && (qs = queues) != null &&
                    (n = qs.length) > 0) {
-                int i = r, step = (r >>> 16) | 1;
+                int i = externalQueueAffinity ? (w.internalQueueIndex ^ 1) : r;
+                int step = (r >>> 16) | 1;
                 r ^= r << 13; r ^= r >>> 17; r ^= r << 5; // xorshift
                 scan: for (int j = n; j != 0; --j, i += step) {
                     WorkQueue q; int qid;
@@ -2579,6 +2584,11 @@ public class ForkJoinPool extends AbstractExecutorService
             ThreadLocalRandom.localInit();   // initialize caller's probe
             r = ThreadLocalRandom.getProbe();
         }
+        return externalSubmissionQueue(rejectOnShutdown, r, false);
+    }
+
+    final WorkQueue externalSubmissionQueue(boolean rejectOnShutdown,
+                                            int r, boolean sticky) {
         for (;;) {
             WorkQueue q; WorkQueue[] qs; int n, id, i;
             if ((qs = queues) == null || (n = qs.length) <= 0)
@@ -2597,7 +2607,8 @@ public class ForkJoinPool extends AbstractExecutorService
                 }
                 return q;
             }
-            r = ThreadLocalRandom.advanceProbe(r); // move
+            if (!sticky)
+                r = ThreadLocalRandom.advanceProbe(r); // move
         }
         throw new RejectedExecutionException();
     }
@@ -3021,6 +3032,44 @@ public class ForkJoinPool extends AbstractExecutorService
     }
 
     /**
+     * Constructor with external queue affinity option.
+     *
+     * @param parallelism the parallelism level
+     * @param factory the factory for creating new threads
+     * @param handler the handler for internal worker threads that
+     *        terminate due to unrecoverable errors
+     * @param asyncMode if true, establishes local FIFO scheduling
+     *        mode for forked tasks
+     * @param corePoolSize the number of threads to keep in the pool
+     * @param maximumPoolSize the maximum number of threads allowed
+     * @param minimumRunnable the minimum number of allowed runnable
+     *        threads
+     * @param saturate if non-null, a predicate invoked upon attempts
+     *        to create more than the maximum total allowed threads
+     * @param keepAliveTime the elapsed time since last use before
+     *        a thread is terminated
+     * @param unit the time unit for the {@code keepAliveTime} argument
+     * @param externalQueueAffinity if true, enables external queue
+     *        affinity for virtual threads
+     */
+    protected ForkJoinPool(int parallelism,
+                 ForkJoinWorkerThreadFactory factory,
+                 UncaughtExceptionHandler handler,
+                 boolean asyncMode,
+                 int corePoolSize,
+                 int maximumPoolSize,
+                 int minimumRunnable,
+                 Predicate<? super ForkJoinPool> saturate,
+                 long keepAliveTime,
+                 TimeUnit unit,
+                 boolean externalQueueAffinity) {
+        this(parallelism, factory, handler, asyncMode,
+             corePoolSize, maximumPoolSize, minimumRunnable,
+             saturate, keepAliveTime, unit);
+        this.externalQueueAffinity = externalQueueAffinity;
+    }
+
+    /**
      * Constructor for common pool using parameters possibly
      * overridden by system properties
      */
@@ -3247,6 +3296,29 @@ public class ForkJoinPool extends AbstractExecutorService
         Objects.requireNonNull(task);
         externalSubmissionQueue(true).push(task, this, false);
         return task;
+    }
+
+    /**
+     * Submits the given task targeting a specific worker identified by
+     * its dense registration index. If the current carrier thread is
+     * the target worker, the task is pushed directly to its local queue.
+     * Otherwise, the task is pushed to an external submission queue
+     * at a deterministic even slot derived from the worker index.
+     *
+     * @param task the task to submit
+     * @param workerIndex the target worker's registration index (hint)
+     */
+    protected void submitToWorker(ForkJoinTask<?> task, int workerIndex) {
+        Objects.requireNonNull(task);
+        Thread t;
+        if (((t = JLA.currentCarrierThread()) instanceof ForkJoinWorkerThread wt) &&
+            wt.pool == this &&
+            wt.workQueue.internalQueueIndex == ((workerIndex << 1) | 1)) {
+            wt.workQueue.push(task, null, true);
+        } else {
+            int r = workerIndex << 1;
+            externalSubmissionQueue(true, r, true).push(task, this, false);
+        }
     }
 
     /**
