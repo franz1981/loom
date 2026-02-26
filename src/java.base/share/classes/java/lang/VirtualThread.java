@@ -442,9 +442,7 @@ final class VirtualThread extends BaseVirtualThread {
         boolean done = false;
         while (!done) {
             try {
-                if (affinityWorkerIndex >= 0 && scheduler instanceof BuiltinForkJoinPoolScheduler s) {
-                    s.submitToTargetWorker(ForkJoinTask.adapt(runContinuation), affinityWorkerIndex);
-                } else if (currentThread().isVirtual()) {
+                if (currentThread().isVirtual()) {
                     // Pin the continuation to prevent the virtual thread from unmounting
                     // when submitting a task. For the default scheduler this ensures that
                     // the carrier doesn't change when pushing a task. For other schedulers
@@ -552,15 +550,15 @@ final class VirtualThread extends BaseVirtualThread {
      */
     private void externalSubmitRunContinuationOrThrow() {
         try {
-            if (affinityWorkerIndex >= 0 && scheduler instanceof BuiltinForkJoinPoolScheduler s) {
-                s.submitToTargetWorker(ForkJoinTask.adapt(runContinuation), affinityWorkerIndex);
-            } else if (currentThread().isVirtual()) {
+            if (currentThread().isVirtual()) {
                 // Pin the continuation to prevent the virtual thread from unmounting
                 // when submitting a task. This avoids deadlock that could arise due to
                 // carriers and virtual threads contending for a lock.
                 Continuation.pin();
                 try {
-                    if (scheduler == BUILTIN_SCHEDULER
+                    if (affinityWorkerIndex >= 0) {
+                        scheduler.onStart(runContinuation);
+                    } else if (scheduler == BUILTIN_SCHEDULER
                             && currentCarrierThread() instanceof CarrierThread ct) {
                         ct.getPool().externalSubmit(ForkJoinTask.adapt(runContinuation));
                     } else {
@@ -1577,16 +1575,20 @@ final class VirtualThread extends BaseVirtualThread {
 
         @Override
         public void onStart(VirtualThreadTask task) {
-            execute(ForkJoinTask.adapt(task));
+            if (task.thread() instanceof VirtualThread vt && vt.affinityWorkerIndex >= 0) {
+                submitToWorker(ForkJoinTask.adapt(task), vt.affinityWorkerIndex);
+            } else {
+                execute(ForkJoinTask.adapt(task));
+            }
         }
 
         @Override
         public void onContinue(VirtualThreadTask task) {
-            execute(ForkJoinTask.adapt(task));
-        }
-
-        void submitToTargetWorker(ForkJoinTask<?> task, int workerIndex) {
-            submitToWorker(task, workerIndex);
+            if (task.thread() instanceof VirtualThread vt && vt.affinityWorkerIndex >= 0) {
+                submitToWorker(ForkJoinTask.adapt(task), vt.affinityWorkerIndex);
+            } else {
+                execute(ForkJoinTask.adapt(task));
+            }
         }
 
         @Override
