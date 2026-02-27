@@ -1637,7 +1637,6 @@ public class ForkJoinPool extends AbstractExecutorService
     boolean externalQueueAffinity;       // start scan at affine external queue
     volatile long stealCount;            // collects worker nsteals
     volatile long threadIds;             // for worker thread names
-    int nextWorkerIndex;                 // next dense index for registerWorker
 
     @jdk.internal.vm.annotation.Contended("fjpctl") // segregate
     volatile long ctl;                   // main pool control
