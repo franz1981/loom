@@ -1634,7 +1634,8 @@ public class ForkJoinPool extends AbstractExecutorService
     volatile long runState;              // versioned, lockable
     final long keepAlive;                // milliseconds before dropping if idle
     final long config;                   // static configuration bits
-    boolean externalQueueAffinity;       // start scan at affine external queue
+    static final boolean externalQueueAffinity =              // start scan at affine external queue
+        Boolean.parseBoolean(System.getProperty("jdk.virtualThreadScheduler.affinity", "false"));
     volatile long stealCount;            // collects worker nsteals
     volatile long threadIds;             // for worker thread names
 
@@ -3028,44 +3029,6 @@ public class ForkJoinPool extends AbstractExecutorService
         this.poolName = name;
         this.workerNamePrefix = name + "-worker-";
         this.container = SharedThreadContainer.create(name);
-    }
-
-    /**
-     * Constructor with external queue affinity option.
-     *
-     * @param parallelism the parallelism level
-     * @param factory the factory for creating new threads
-     * @param handler the handler for internal worker threads that
-     *        terminate due to unrecoverable errors
-     * @param asyncMode if true, establishes local FIFO scheduling
-     *        mode for forked tasks
-     * @param corePoolSize the number of threads to keep in the pool
-     * @param maximumPoolSize the maximum number of threads allowed
-     * @param minimumRunnable the minimum number of allowed runnable
-     *        threads
-     * @param saturate if non-null, a predicate invoked upon attempts
-     *        to create more than the maximum total allowed threads
-     * @param keepAliveTime the elapsed time since last use before
-     *        a thread is terminated
-     * @param unit the time unit for the {@code keepAliveTime} argument
-     * @param externalQueueAffinity if true, enables external queue
-     *        affinity for virtual threads
-     */
-    protected ForkJoinPool(int parallelism,
-                 ForkJoinWorkerThreadFactory factory,
-                 UncaughtExceptionHandler handler,
-                 boolean asyncMode,
-                 int corePoolSize,
-                 int maximumPoolSize,
-                 int minimumRunnable,
-                 Predicate<? super ForkJoinPool> saturate,
-                 long keepAliveTime,
-                 TimeUnit unit,
-                 boolean externalQueueAffinity) {
-        this(parallelism, factory, handler, asyncMode,
-             corePoolSize, maximumPoolSize, minimumRunnable,
-             saturate, keepAliveTime, unit);
-        this.externalQueueAffinity = externalQueueAffinity;
     }
 
     /**

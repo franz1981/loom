@@ -1569,8 +1569,7 @@ final class VirtualThread extends BaseVirtualThread {
             Thread.UncaughtExceptionHandler handler = (t, e) -> { };
             boolean asyncMode = true; // FIFO
             super(parallelism, factory, handler, asyncMode,
-                    0, maxPoolSize, minRunnable, pool -> true, 30L, SECONDS,
-                    true /* externalQueueAffinity */);
+                    0, maxPoolSize, minRunnable, pool -> true, 30L, SECONDS);
         }
 
         @Override
