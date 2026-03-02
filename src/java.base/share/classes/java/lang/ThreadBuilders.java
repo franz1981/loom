@@ -226,6 +226,7 @@ class ThreadBuilders {
         private boolean useRoundRobinAffinity;
         private boolean useCallerAffinity;
         private int inheritedAffinityWorkerIndex = -1;
+        private AtomicInteger roundRobinCounter;
 
         VirtualThreadBuilder() {
         }
@@ -259,6 +260,7 @@ class ThreadBuilders {
             this.useRoundRobinAffinity = true;
             this.useCallerAffinity = false;
             this.inheritedAffinityWorkerIndex = -1;
+            this.roundRobinCounter = new AtomicInteger();
             return this;
         }
 
@@ -284,11 +286,38 @@ class ThreadBuilders {
                                           preferredCarrier,
                                           nextThreadName(),
                                           characteristics(),
-                                          task);
+                                          task,
+                                          resolveAffinityIndex());
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
                 thread.uncaughtExceptionHandler(uhe);
             return thread;
+        }
+
+        private int resolveAffinityIndex() {
+            if (useRoundRobinAffinity) {
+                ForkJoinPool pool = resolvePool();
+                if (pool != null) {
+                    int parallelism = pool.getParallelism();
+                    if (parallelism > 0) {
+                        return Math.floorMod(roundRobinCounter.getAndIncrement(), parallelism);
+                    }
+                }
+            }
+            if (useCallerAffinity) {
+                return resolveWorkerIndex(Thread.currentThread());
+            }
+            return inheritedAffinityWorkerIndex;
+        }
+
+        private ForkJoinPool resolvePool() {
+            if (scheduler == null) {
+                var defaultScheduler = VirtualThread.defaultScheduler();
+                if (defaultScheduler instanceof ForkJoinPool pool) {
+                    return pool;
+                }
+            }
+            return null;
         }
 
         @Override
