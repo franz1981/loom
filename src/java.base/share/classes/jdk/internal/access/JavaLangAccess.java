@@ -628,6 +628,12 @@ public interface JavaLangAccess {
     void unparkVirtualThread(Thread thread);
 
     /**
+     * Returns the affinity worker index for the given virtual thread, or -1
+     * if the thread is not a virtual thread or has no affinity.
+     */
+    int virtualThreadAffinityIndex(Thread thread);
+
+    /**
      * Returns the builtin virtual thread scheduler.
      */
     Thread.VirtualThreadScheduler builtinVirtualThreadScheduler();

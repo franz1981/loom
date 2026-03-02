@@ -493,12 +493,16 @@ public abstract class Poller {
      * "master poller" that runs in a dedicated platform thread.
      */
     private static class VThreadsPollerGroup extends PollerGroup {
+        private static final boolean AFFINITY_ENABLED =
+            Boolean.parseBoolean(System.getProperty("jdk.virtualThreadScheduler.affinity", "false"));
+
         private final Poller masterPoller;
         private final Poller[] readPollers;
         private final Poller[] writePollers;
 
         // keep virtual thread pollers alive
-        private final Executor executor;
+        private final Executor readExecutor;
+        private final Executor writeExecutor;
 
         VThreadsPollerGroup(PollerProvider provider,
                             int readPollerCount,
@@ -526,22 +530,30 @@ public abstract class Poller {
             this.readPollers = readPollers;
             this.writePollers = writePollers;
 
-            ThreadFactory factory = Thread.ofVirtual()
+            Thread.Builder.OfVirtual readBuilder = Thread.ofVirtual()
                     .inheritInheritableThreadLocals(false)
-                    .name("SubPoller-", 0)
-                    .uncaughtExceptionHandler((_, e) -> e.printStackTrace())
-                    .factory();
-            this.executor = Executors.newThreadPerTaskExecutor(factory);
+                    .name("Read-SubPoller-", 0)
+                    .uncaughtExceptionHandler((_, e) -> e.printStackTrace());
+            Thread.Builder.OfVirtual writeBuilder = Thread.ofVirtual()
+                    .inheritInheritableThreadLocals(false)
+                    .name("Write-SubPoller-", 0)
+                    .uncaughtExceptionHandler((_, e) -> e.printStackTrace());
+            if (AFFINITY_ENABLED) {
+                readBuilder = readBuilder.roundRobinAffinity();
+                writeBuilder = writeBuilder.roundRobinAffinity();
+            }
+            this.readExecutor = Executors.newThreadPerTaskExecutor(readBuilder.factory());
+            this.writeExecutor = Executors.newThreadPerTaskExecutor(writeBuilder.factory());
         }
 
         @Override
         void start() {
             startPlatformThread("Master-Poller", masterPoller::pollerLoop);
             Arrays.stream(readPollers).forEach(p -> {
-                executor.execute(() -> p.subPollerLoop(masterPoller));
+                readExecutor.execute(() -> p.subPollerLoop(masterPoller));
             });
             Arrays.stream(writePollers).forEach(p -> {
-                executor.execute(() -> p.subPollerLoop(masterPoller));
+                writeExecutor.execute(() -> p.subPollerLoop(masterPoller));
             });
         }
 
@@ -555,11 +567,28 @@ public abstract class Poller {
             return writePollers[index];
         }
 
+        private Poller readPollerForAffinity(int affinityIndex) {
+            return readPollers[affinityIndex & (readPollers.length - 1)];
+        }
+
+        private Poller writePollerForAffinity(int affinityIndex) {
+            return writePollers[affinityIndex & (writePollers.length - 1)];
+        }
+
         @Override
         void poll(int fdVal, int event, long nanos, BooleanSupplier isOpen) throws IOException {
-            Poller poller = (event == Net.POLLIN)
-                    ? readPoller(fdVal)
-                    : writePoller(fdVal);
+            Poller poller;
+            int affinityIndex;
+            if (AFFINITY_ENABLED
+                    && (affinityIndex = JLA.virtualThreadAffinityIndex(Thread.currentThread())) >= 0) {
+                poller = (event == Net.POLLIN)
+                        ? readPollerForAffinity(affinityIndex)
+                        : writePollerForAffinity(affinityIndex);
+            } else {
+                poller = (event == Net.POLLIN)
+                        ? readPoller(fdVal)
+                        : writePoller(fdVal);
+            }
             poller.poll(fdVal, nanos, isOpen);
         }
 

@@ -2322,6 +2322,13 @@ public final class System {
                 }
             }
 
+            public int virtualThreadAffinityIndex(Thread thread) {
+                if (thread instanceof VirtualThread vt) {
+                    return vt.affinityWorkerIndex;
+                }
+                return -1;
+            }
+
             public Thread.VirtualThreadScheduler builtinVirtualThreadScheduler() {
                 return VirtualThread.builtinScheduler(true);
             }
