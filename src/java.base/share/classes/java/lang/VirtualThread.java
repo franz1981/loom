@@ -107,6 +107,9 @@ final class VirtualThread extends BaseVirtualThread {
     // carrier affinity hint: worker index in the ForkJoinPool, or -1 for no affinity
     final int affinityWorkerIndex;
 
+    // when true, onStart pushes to the caller's local queue (no signal) if on a carrier
+    final boolean localStart;
+
     // virtual thread state, accessed by VM
     private volatile int state;
 
@@ -270,6 +273,16 @@ final class VirtualThread extends BaseVirtualThread {
                   int characteristics,
                   Runnable task,
                   int affinityWorkerIndex) {
+        this(scheduler, preferredCarrier, name, characteristics, task, affinityWorkerIndex, false);
+    }
+
+    VirtualThread(VirtualThreadScheduler scheduler,
+                  Thread preferredCarrier,
+                  String name,
+                  int characteristics,
+                  Runnable task,
+                  int affinityWorkerIndex,
+                  boolean localStart) {
         super(name, characteristics, /*bound*/ false);
         Objects.requireNonNull(task);
 
@@ -282,6 +295,7 @@ final class VirtualThread extends BaseVirtualThread {
         this.scheduler = scheduler;
         this.cont = new VThreadContinuation(this, task);
         this.affinityWorkerIndex = affinityWorkerIndex;
+        this.localStart = localStart;
 
         if (scheduler == BUILTIN_SCHEDULER) {
             this.runContinuation = new VThreadTask(this);
@@ -1574,8 +1588,14 @@ final class VirtualThread extends BaseVirtualThread {
 
         @Override
         public void onStart(VirtualThreadTask task) {
-            if (task.thread() instanceof VirtualThread vt && vt.affinityWorkerIndex >= 0) {
-                submitToWorker(ForkJoinTask.adapt(task), vt.affinityWorkerIndex);
+            if (task.thread() instanceof VirtualThread vt) {
+                if (vt.localStart) {
+                    lazySubmit(ForkJoinTask.adapt(task));
+                } else if (vt.affinityWorkerIndex >= 0) {
+                    submitToWorker(ForkJoinTask.adapt(task), vt.affinityWorkerIndex);
+                } else {
+                    execute(ForkJoinTask.adapt(task));
+                }
             } else {
                 execute(ForkJoinTask.adapt(task));
             }

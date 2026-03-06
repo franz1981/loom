@@ -1317,6 +1317,23 @@ public class Thread implements Runnable {
              * @return this builder
              */
             OfVirtual inheritAffinity();
+
+            /**
+             * Requests that the virtual thread's initial task be pushed to the
+             * caller's local work queue when started from a carrier thread in
+             * the default scheduler's {@code ForkJoinPool}. This avoids the
+             * cost of an external submission and signal.
+             *
+             * <p> If the calling thread is not a carrier in the default
+             * scheduler pool, the thread is started normally.
+             *
+             * <p> This only affects {@link Thread#start()} (initial scheduling).
+             * Subsequent continuations are scheduled according to affinity
+             * settings or the default policy.
+             *
+             * @return this builder
+             */
+            OfVirtual inheritLocality();
         }
     }
 

@@ -225,6 +225,7 @@ class ThreadBuilders {
         private Thread.VirtualThreadScheduler scheduler;
         private boolean useRoundRobinAffinity;
         private boolean useCallerAffinity;
+        private boolean useLocalStart;
         private int inheritedAffinityWorkerIndex = -1;
         private AtomicInteger roundRobinCounter;
 
@@ -280,6 +281,12 @@ class ThreadBuilders {
             return this;
         }
 
+        @Override
+        public OfVirtual inheritLocality() {
+            this.useLocalStart = true;
+            return this;
+        }
+
         Thread unstarted(Runnable task, Thread preferredCarrier) {
             Objects.requireNonNull(task);
             var thread = newVirtualThread(scheduler,
@@ -287,7 +294,8 @@ class ThreadBuilders {
                                           nextThreadName(),
                                           characteristics(),
                                           task,
-                                          resolveAffinityIndex());
+                                          resolveAffinityIndex(),
+                                          useLocalStart);
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
                 thread.uncaughtExceptionHandler(uhe);
@@ -336,7 +344,7 @@ class ThreadBuilders {
         public ThreadFactory factory() {
             return new VirtualThreadFactory(scheduler, name(), counter(), characteristics(),
                     uncaughtExceptionHandler(), useRoundRobinAffinity,
-                    useCallerAffinity, inheritedAffinityWorkerIndex);
+                    useCallerAffinity, useLocalStart, inheritedAffinityWorkerIndex);
         }
     }
 
@@ -442,6 +450,7 @@ class ThreadBuilders {
         private final Thread.VirtualThreadScheduler scheduler;
         private final boolean useRoundRobinAffinity;
         private final boolean useCallerAffinity;
+        private final boolean useLocalStart;
         private final int inheritedAffinityWorkerIndex;
         private final AtomicInteger roundRobinCounter;
 
@@ -452,11 +461,13 @@ class ThreadBuilders {
                              UncaughtExceptionHandler uhe,
                              boolean useRoundRobinAffinity,
                              boolean useCallerAffinity,
+                             boolean useLocalStart,
                              int inheritedAffinityWorkerIndex) {
             super(name, start, characteristics, uhe);
             this.scheduler = scheduler;
             this.useRoundRobinAffinity = useRoundRobinAffinity;
             this.useCallerAffinity = useCallerAffinity;
+            this.useLocalStart = useLocalStart;
             this.inheritedAffinityWorkerIndex = inheritedAffinityWorkerIndex;
             this.roundRobinCounter = useRoundRobinAffinity ? new AtomicInteger() : null;
         }
@@ -467,7 +478,7 @@ class ThreadBuilders {
             String name = nextThreadName();
             int affinityIndex = resolveAffinityIndex();
             Thread thread = newVirtualThread(scheduler, null, name, characteristics(),
-                    task, affinityIndex);
+                    task, affinityIndex, useLocalStart);
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
                 thread.uncaughtExceptionHandler(uhe);
@@ -527,9 +538,24 @@ class ThreadBuilders {
                                            int characteristics,
                                            Runnable task,
                                            int affinityWorkerIndex) {
+        return newVirtualThread(scheduler, preferredCarrier, name, characteristics,
+                task, affinityWorkerIndex, false);
+    }
+
+    /**
+     * Creates a new virtual thread to run the given task with an affinity hint
+     * and optional local-start behavior.
+     */
+    private static Thread newVirtualThread(Thread.VirtualThreadScheduler scheduler,
+                                           Thread preferredCarrier,
+                                           String name,
+                                           int characteristics,
+                                           Runnable task,
+                                           int affinityWorkerIndex,
+                                           boolean localStart) {
         if (ContinuationSupport.isSupported()) {
             return new VirtualThread(scheduler, preferredCarrier, name, characteristics,
-                    task, affinityWorkerIndex);
+                    task, affinityWorkerIndex, localStart);
         } else {
             if (scheduler != null)
                 throw new UnsupportedOperationException();
