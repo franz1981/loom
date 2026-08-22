@@ -118,6 +118,11 @@ class MpscWorkStealing {
 
         assertNonStealableStaysLocal(Thread.ofVirtual().stickyAffinity()::start);
 
+        Thread builderRoundRobin = Thread.ofVirtual()
+                .roundRobinAffinity()
+                .unstarted(() -> { });
+        assertTrue((int) getField(builderRoundRobin, "affinityHint") >= 0);
+
         ThreadFactory roundRobinFactory = Thread.ofVirtual()
                 .roundRobinAffinity()
                 .factory();

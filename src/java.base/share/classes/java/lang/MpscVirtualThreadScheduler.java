@@ -61,6 +61,10 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
 
     private static final long PROBE =
             U.objectFieldOffset(Thread.class, "threadLocalRandomProbe");
+    private static final long CONTEXT_CLASS_LOADER =
+            U.objectFieldOffset(Thread.class, "contextClassLoader");
+    private static final long INHERITABLE_THREAD_LOCALS =
+            U.objectFieldOffset(Thread.class, "inheritableThreadLocals");
 
     private final CarrierThread[] carriers;
     private final boolean workStealingEnabled;
@@ -154,11 +158,14 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
     }
 
     private CarrierThread continueCarrierFor(VirtualThread vt) {
+        int hint = vt.affinityHint;
+        if (vt.hasRoundRobinAffinity() && hint >= 0) {
+            return carriers[Math.floorMod(hint, carriers.length)];
+        }
         Thread caller = Thread.currentCarrierThread();
         if (caller instanceof CarrierThread ct && ct.scheduler == this) {
             return ct;
         }
-        int hint = vt.affinityHint;
         if (hint >= 0) {
             return carriers[Math.floorMod(hint, carriers.length)];
         }
@@ -227,6 +234,8 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
             super(null, null, "mpsc-carrier-" + id, 0, false);
             this.id = id;
             this.scheduler = scheduler;
+            U.putReference(this, CONTEXT_CLASS_LOADER, ClassLoader.getSystemClassLoader());
+            U.putReference(this, INHERITABLE_THREAD_LOCALS, null);
             setDaemon(true);
         }
 
