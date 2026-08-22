@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.Thread.VirtualThreadScheduler;
 import java.lang.Thread.VirtualThreadTask;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.locks.LockSupport;
 import jdk.internal.misc.Unsafe;
 import jdk.internal.vm.annotation.Contended;
@@ -35,11 +36,14 @@ import sun.nio.ch.CarrierLocalPoller;
 
 /**
  * An alternative virtual thread scheduler using a single MPSC queue per carrier.
- * No work stealing — each carrier drains only its own queue.
+ * By default each carrier drains only its own queue. An experimental opt-in mode
+ * allows stealable virtual threads to spill to a shared MPMC queue while sticky
+ * and round-robin-affined virtual threads remain carrier-local.
  *
  * <p>External submissions use a probe-based hash (FJP-style) to distribute
- * across carriers. Carrier affinity is set once at start via affinityHint;
- * onContinue always routes back to the same carrier.
+ * across carriers. Sticky and round-robin-affined virtual threads keep a
+ * carrier-local affinity; ordinary virtual threads may spill to the shared
+ * queue when work stealing is enabled and the local queue is above threshold.
  *
  * <p>With poller Mode 4 (CARRIER_LOCAL_POLLER), each carrier owns its own
  * epoll fd. VT fds register directly — no sub-pollers, no master poller.
@@ -48,16 +52,36 @@ import sun.nio.ch.CarrierLocalPoller;
 final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
 
     private static final Unsafe U = Unsafe.getUnsafe();
+    private static final String WORK_STEALING_PROPERTY =
+            "jdk.virtualThreadScheduler.mpsc.workStealing";
+    private static final String STEALABLE_THRESHOLD_PROPERTY =
+            "jdk.virtualThreadScheduler.mpsc.localStealableThreshold";
+    private static final int DEFAULT_LOCAL_STEALABLE_THRESHOLD = 64;
+    private static final int SHARED_POLL_INTERVAL = 63;
 
     private static final long PROBE =
             U.objectFieldOffset(Thread.class, "threadLocalRandomProbe");
+    private static final long CONTEXT_CLASS_LOADER =
+            U.objectFieldOffset(Thread.class, "contextClassLoader");
+    private static final long INHERITABLE_THREAD_LOCALS =
+            U.objectFieldOffset(Thread.class, "inheritableThreadLocals");
 
     private final CarrierThread[] carriers;
+    private final boolean workStealingEnabled;
+    private final int localStealableThreshold;
+    private final ConcurrentLinkedQueue<VirtualThreadTask> sharedQueue;
 
     MpscVirtualThreadScheduler(int parallelism) {
         if (parallelism < 1) {
             throw new IllegalArgumentException("parallelism must be >= 1");
         }
+        boolean workStealingEnabled = Boolean.getBoolean(WORK_STEALING_PROPERTY);
+        this.workStealingEnabled = workStealingEnabled;
+        this.localStealableThreshold = workStealingEnabled
+                ? Math.max(0, Integer.getInteger(STEALABLE_THRESHOLD_PROPERTY,
+                        DEFAULT_LOCAL_STEALABLE_THRESHOLD))
+                : Integer.MAX_VALUE;
+        this.sharedQueue = workStealingEnabled ? new ConcurrentLinkedQueue<>() : null;
         this.carriers = new CarrierThread[parallelism];
         for (int i = 0; i < parallelism; i++) {
             carriers[i] = new CarrierThread(i, this);
@@ -70,28 +94,36 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
     @Override
     public void onStart(VirtualThreadTask task) {
         VirtualThread vt = (VirtualThread) task.thread();
-        CarrierThread target;
-        if (vt.affinityHint >= 0) {
-            target = carriers[Math.floorMod(vt.affinityHint, carriers.length)];
-        } else {
-            target = carrierFor();
-        }
-        vt.affinityHint = target.id;
-        enqueue(target, task);
+        enqueue(task, startCarrierFor(vt));
     }
 
     @Override
     public void onContinue(VirtualThreadTask task) {
-        int hint = ((VirtualThread) task.thread()).affinityHint;
-        if (hint >= 0 && hint < carriers.length) {
-            enqueue(carriers[hint], task);
-            return;
-        }
-        onStart(task);
+        enqueue(task, continueCarrierFor((VirtualThread) task.thread()));
     }
 
-    private static void enqueue(CarrierThread carrier, VirtualThreadTask task) {
+    private void enqueue(VirtualThreadTask task, CarrierThread carrier) {
+        VirtualThread vt = (VirtualThread) task.thread();
+        if (!workStealingEnabled || !vt.isMpscStealable()) {
+            vt.affinityHint = carrier.id;
+            enqueueLocal(carrier, task);
+            return;
+        }
+        if (carrier.queue.offerIfBelowThreshold(task, localStealableThreshold)) {
+            vt.affinityHint = carrier.id;
+            signalCarrier(carrier);
+        } else {
+            sharedQueue.offer(task);
+            signalSharedWork();
+        }
+    }
+
+    private static void enqueueLocal(CarrierThread carrier, VirtualThreadTask task) {
         carrier.queue.offer(task);
+        signalCarrier(carrier);
+    }
+
+    private static void signalCarrier(CarrierThread carrier) {
         if (carrier.carrierState == CarrierThread.PARKED) {
             if (carrier.poller != null) {
                 try {
@@ -103,6 +135,41 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                 LockSupport.unpark(carrier);
             }
         }
+    }
+
+    private void signalSharedWork() {
+        CarrierThread[] carriers = this.carriers;
+        int start = Math.floorMod(nextProbe(), carriers.length);
+        for (int i = 0; i < carriers.length; i++) {
+            CarrierThread carrier = carriers[(start + i) % carriers.length];
+            if (carrier.carrierState == CarrierThread.PARKED) {
+                signalCarrier(carrier);
+                return;
+            }
+        }
+    }
+
+    private CarrierThread startCarrierFor(VirtualThread vt) {
+        int hint = vt.affinityHint;
+        if (hint >= 0) {
+            return carriers[Math.floorMod(hint, carriers.length)];
+        }
+        return carrierFor();
+    }
+
+    private CarrierThread continueCarrierFor(VirtualThread vt) {
+        int hint = vt.affinityHint;
+        if (vt.hasRoundRobinAffinity() && hint >= 0) {
+            return carriers[Math.floorMod(hint, carriers.length)];
+        }
+        Thread caller = Thread.currentCarrierThread();
+        if (caller instanceof CarrierThread ct && ct.scheduler == this) {
+            return ct;
+        }
+        if (hint >= 0) {
+            return carriers[Math.floorMod(hint, carriers.length)];
+        }
+        return carrierFor();
     }
 
     private CarrierThread carrierFor() {
@@ -122,6 +189,29 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
             U.putInt(Thread.currentThread(), PROBE, p);
         }
         return p;
+    }
+
+    private static int nextProbe() {
+        int p = probe();
+        p ^= p << 13;
+        p ^= p >>> 17;
+        p ^= p << 5;
+        if (p == 0) {
+            p = 1;
+        }
+        U.putInt(Thread.currentThread(), PROBE, p);
+        return p;
+    }
+
+    private VirtualThreadTask pollSharedTask(CarrierThread carrier) {
+        if (!workStealingEnabled) {
+            return null;
+        }
+        VirtualThreadTask task = sharedQueue.poll();
+        if (task != null) {
+            ((VirtualThread) task.thread()).affinityHint = carrier.id;
+        }
+        return task;
     }
 
     // ---- Carrier thread ----
@@ -144,6 +234,8 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
             super(null, null, "mpsc-carrier-" + id, 0, false);
             this.id = id;
             this.scheduler = scheduler;
+            U.putReference(this, CONTEXT_CLASS_LOADER, ClassLoader.getSystemClassLoader());
+            U.putReference(this, INHERITABLE_THREAD_LOCALS, null);
             setDaemon(true);
         }
 
@@ -173,14 +265,24 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         private void eventLoop() {
             var queue = this.queue;
             var poller = this.poller;
+            int sharedPollCountdown = SHARED_POLL_INTERVAL;
             for (;;) {
                 // drain tasks with time budget
                 int drained = 0;
                 long drainStart = System.nanoTime();
                 VirtualThreadTask task;
                 while ((task = queue.poll()) != null) {
-                    try { task.run(); } catch (Throwable t) { }
-                    if ((++drained & (TIME_CHECK_INTERVAL - 1)) == 0
+                    runTask(task);
+                    drained++;
+                    if (scheduler.workStealingEnabled && --sharedPollCountdown == 0) {
+                        sharedPollCountdown = SHARED_POLL_INTERVAL;
+                        VirtualThreadTask sharedTask = scheduler.pollSharedTask(this);
+                        if (sharedTask != null) {
+                            runTask(sharedTask);
+                            drained++;
+                        }
+                    }
+                    if ((drained & (TIME_CHECK_INTERVAL - 1)) == 0
                             && System.nanoTime() - drainStart >= DRAIN_BUDGET_NS) {
                         break;
                     }
@@ -196,17 +298,31 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                     continue;
                 }
 
+                if ((task = scheduler.pollSharedTask(this)) != null) {
+                    sharedPollCountdown = SHARED_POLL_INTERVAL;
+                    runTask(task);
+                    continue;
+                }
+
                 // one more non-blocking check before parking
                 try {
                     if (poller.poll(0) > 0) continue;
                 } catch (IOException e) { }
 
-                // genuinely idle: blocking poll
+                // Publish idleness before the final local/shared recheck so a concurrent
+                // shared submit either wakes this carrier or is observed below before
+                // the blocking poll. A missed immediate wake-up is therefore benign.
                 carrierState = PARKED;
 
                 if ((task = queue.poll()) != null) {
                     carrierState = RUNNING;
-                    try { task.run(); } catch (Throwable t) { }
+                    runTask(task);
+                    continue;
+                }
+                if ((task = scheduler.pollSharedTask(this)) != null) {
+                    carrierState = RUNNING;
+                    sharedPollCountdown = SHARED_POLL_INTERVAL;
+                    runTask(task);
                     continue;
                 }
 
@@ -222,10 +338,24 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
          */
         private void plainLoop() {
             var queue = this.queue;
+            int sharedPollCountdown = SHARED_POLL_INTERVAL;
             for (;;) {
                 VirtualThreadTask task = queue.poll();
                 if (task != null) {
-                    try { task.run(); } catch (Throwable t) { }
+                    runTask(task);
+                    if (scheduler.workStealingEnabled && --sharedPollCountdown == 0) {
+                        sharedPollCountdown = SHARED_POLL_INTERVAL;
+                        VirtualThreadTask sharedTask = scheduler.pollSharedTask(this);
+                        if (sharedTask != null) {
+                            runTask(sharedTask);
+                        }
+                    }
+                    continue;
+                }
+
+                if ((task = scheduler.pollSharedTask(this)) != null) {
+                    sharedPollCountdown = SHARED_POLL_INTERVAL;
+                    runTask(task);
                     continue;
                 }
 
@@ -233,7 +363,13 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
 
                 if ((task = queue.poll()) != null) {
                     carrierState = RUNNING;
-                    try { task.run(); } catch (Throwable t) { }
+                    runTask(task);
+                    continue;
+                }
+                if ((task = scheduler.pollSharedTask(this)) != null) {
+                    carrierState = RUNNING;
+                    sharedPollCountdown = SHARED_POLL_INTERVAL;
+                    runTask(task);
                     continue;
                 }
 
@@ -241,10 +377,17 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                 carrierState = RUNNING;
             }
         }
+
+        private static void runTask(VirtualThreadTask task) {
+            try {
+                task.run();
+            } catch (Throwable t) { }
+        }
     }
 
     @Override
     public String toString() {
-        return "MpscVirtualThreadScheduler[carriers=" + carriers.length + "]";
+        return "MpscVirtualThreadScheduler[carriers=" + carriers.length
+                + ",workStealing=" + workStealingEnabled + "]";
     }
 }

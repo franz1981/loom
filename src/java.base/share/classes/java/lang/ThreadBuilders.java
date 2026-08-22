@@ -217,6 +217,7 @@ class ThreadBuilders {
      */
     static final class VirtualThreadBuilder
             extends BaseThreadBuilder implements OfVirtual {
+        private long roundRobinCount;
         private Thread.VirtualThreadScheduler scheduler;
 
         VirtualThreadBuilder() {
@@ -265,6 +266,10 @@ class ThreadBuilders {
                                           nextThreadName(),
                                           characteristics(),
                                           task);
+            if ((characteristics() & Thread.ROUND_ROBIN_AFFINITY) != 0
+                    && thread instanceof VirtualThread vt) {
+                vt.affinityHint = Math.floorMod(roundRobinCount++, Integer.MAX_VALUE);
+            }
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
                 thread.uncaughtExceptionHandler(uhe);
@@ -424,7 +429,8 @@ class ThreadBuilders {
             String name = nextThreadName();
             Thread thread = newVirtualThread(scheduler, null, name, characteristics(), task);
             if (roundRobin && thread instanceof VirtualThread vt) {
-                vt.affinityHint = (int) (long) ROUND_ROBIN_COUNT.getAndAdd(this, 1L);
+                long hint = (long) ROUND_ROBIN_COUNT.getAndAdd(this, 1L);
+                vt.affinityHint = Math.floorMod(hint, Integer.MAX_VALUE);
             }
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)

@@ -107,6 +107,7 @@ final class VirtualThread extends BaseVirtualThread {
     private final Continuation cont;
     private final VThreadTask runContinuation;
     private final boolean stickyAffinity;
+    private final boolean roundRobinAffinity;
 
     // virtual thread state, accessed by VM
     private volatile int state;
@@ -248,6 +249,21 @@ final class VirtualThread extends BaseVirtualThread {
         return stickyAffinity;
     }
 
+    /**
+     * Returns true if this virtual thread has round-robin affinity.
+     */
+    boolean hasRoundRobinAffinity() {
+        return roundRobinAffinity;
+    }
+
+    /**
+     * Returns true if this virtual thread can migrate via the experimental MPSC
+     * scheduler's shared spill queue.
+     */
+    boolean isMpscStealable() {
+        return !stickyAffinity && !roundRobinAffinity;
+    }
+
     // Carrier affinity hint. Set by the factory (round-robin counter) or by the
     // scheduler on first start (resolved carrier id). The scheduler resolves it
     // to a carrier via modulus. -1 means no affinity.
@@ -292,6 +308,7 @@ final class VirtualThread extends BaseVirtualThread {
         }
         this.scheduler = scheduler;
         this.stickyAffinity = (characteristics & Thread.STICKY_AFFINITY) != 0;
+        this.roundRobinAffinity = (characteristics & Thread.ROUND_ROBIN_AFFINITY) != 0;
         this.cont = new VThreadContinuation(this, task);
 
         if (scheduler == BUILTIN_SCHEDULER) {
