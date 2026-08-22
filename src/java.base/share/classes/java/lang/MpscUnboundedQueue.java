@@ -39,6 +39,7 @@ final class MpscUnboundedQueue<E> {
     private static final VarHandle PRODUCER_INDEX;
     private static final VarHandle CONSUMER_INDEX;
     private static final VarHandle PRODUCER_LIMIT;
+    private static final VarHandle PRODUCER_THRESHOLD_LIMIT;
     private static final VarHandle ARRAY;
 
     static {
@@ -47,6 +48,8 @@ final class MpscUnboundedQueue<E> {
             PRODUCER_INDEX = lookup.findVarHandle(MpscUnboundedQueue.class, "producerIndex", long.class);
             CONSUMER_INDEX = lookup.findVarHandle(MpscUnboundedQueue.class, "consumerIndex", long.class);
             PRODUCER_LIMIT = lookup.findVarHandle(MpscUnboundedQueue.class, "producerLimit", long.class);
+            PRODUCER_THRESHOLD_LIMIT = lookup.findVarHandle(MpscUnboundedQueue.class,
+                    "producerThresholdLimit", long.class);
             ARRAY = MethodHandles.arrayElementVarHandle(Object[].class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
@@ -68,6 +71,9 @@ final class MpscUnboundedQueue<E> {
     @Contended("producer")
     @SuppressWarnings("FieldMayBeFinal")
     private long producerLimit;
+    @Contended("producer")
+    @SuppressWarnings("FieldMayBeFinal")
+    private long producerThresholdLimit;
     @Contended("producer")
     private long producerMask;
     @Contended("producer")
@@ -136,6 +142,14 @@ final class MpscUnboundedQueue<E> {
         return PRODUCER_LIMIT.compareAndSet(this, expect, newValue);
     }
 
+    private long lvProducerThresholdLimit() {
+        return (long) PRODUCER_THRESHOLD_LIMIT.getAcquire(this);
+    }
+
+    private boolean casProducerThresholdLimit(long expect, long newValue) {
+        return PRODUCER_THRESHOLD_LIMIT.compareAndSet(this, expect, newValue);
+    }
+
     private static <E> void soRefElement(E[] buffer, int offset, E e) {
         ARRAY.setRelease(buffer, offset, e);
     }
@@ -183,6 +197,64 @@ final class MpscUnboundedQueue<E> {
         }
         final int offset = modifiedCalcCircularRefElementOffset(pIndex, mask);
         soRefElement(buffer, offset, e);
+    }
+
+    boolean offerIfBelowThreshold(E e, int threshold) {
+        if (threshold < 0) {
+            throw new IllegalArgumentException("threshold must be >= 0");
+        }
+        if (null == e) {
+            throw new NullPointerException();
+        }
+
+        final long thresholdLimitStep = ((long) threshold) << 1;
+        long mask;
+        E[] buffer;
+        long pIndex;
+
+        while (true) {
+            long producerLimit = lvProducerLimit();
+            long producerThresholdLimit = lvProducerThresholdLimit();
+            pIndex = lvProducerIndex();
+            if ((pIndex & RESIZE_BIT) == 1) {
+                continue;
+            }
+
+            mask = this.producerMask;
+            buffer = this.producerBuffer;
+
+            if (producerThresholdLimit <= pIndex) {
+                long cIndex = lvConsumerIndex();
+                long newThresholdLimit = cIndex + thresholdLimitStep;
+                if (newThresholdLimit <= pIndex) {
+                    return false;
+                }
+                if (!casProducerThresholdLimit(producerThresholdLimit, newThresholdLimit)) {
+                    continue;
+                }
+            }
+
+            if (producerLimit <= pIndex) {
+                int result = offerSlowPath(mask, pIndex, producerLimit);
+                switch (result) {
+                    case CONTINUE_TO_P_INDEX_CAS:
+                        break;
+                    case RETRY:
+                        continue;
+                    case QUEUE_RESIZE:
+                        resize(mask, buffer, pIndex, e);
+                        return true;
+                }
+            }
+
+            if (casProducerIndex(pIndex, pIndex + 2)) {
+                break;
+            }
+        }
+
+        final int offset = modifiedCalcCircularRefElementOffset(pIndex, mask);
+        soRefElement(buffer, offset, e);
+        return true;
     }
 
     private int offerSlowPath(long mask, long pIndex, long producerLimit) {
