@@ -102,12 +102,12 @@ class MpscWorkStealing {
                 assertEquals(0, localQueueSize(0));
             } finally {
                 release.set(true);
-                blocker.join();
-                stealable.join();
+                joinEventually(blocker, "blocker");
+                joinEventually(stealable, "stealable");
             }
         } catch (Throwable t) {
             release.set(true);
-            blocker.join();
+            joinEventually(blocker, "blocker");
             throw t;
         }
     }
@@ -181,12 +181,12 @@ class MpscWorkStealing {
                 assertEquals(0, sharedQueue().size());
             } finally {
                 release.set(true);
-                blocker.join();
-                thread.join();
+                joinEventually(blocker, "blocker");
+                joinEventually(thread, "non-stealable");
             }
         } catch (Throwable t) {
             release.set(true);
-            blocker.join();
+            joinEventually(blocker, "blocker");
             throw t;
         }
     }
@@ -255,6 +255,11 @@ class MpscWorkStealing {
             }
             Thread.sleep(10);
         }
+    }
+
+    private static void joinEventually(Thread thread, String message) throws InterruptedException {
+        thread.join(TIMEOUT_MILLIS);
+        assertFalse(thread.isAlive(), "Timed out waiting for " + message);
     }
 
     @FunctionalInterface
