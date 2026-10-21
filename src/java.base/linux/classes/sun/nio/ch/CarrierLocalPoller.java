@@ -26,6 +26,8 @@ package sun.nio.ch;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.LockSupport;
 import static sun.nio.ch.EPoll.*;
 
@@ -46,9 +48,20 @@ public final class CarrierLocalPoller {
     private final int epfd;
     private final long pollAddress;
     private final EventFD eventfd;
-    private final HashMap<Integer, Thread> fdToThread = new HashMap<>();
+    private final Map<Integer, Thread> fdToThread;
 
     public CarrierLocalPoller() throws IOException {
+        this(false);
+    }
+
+    /**
+     * @param shared true when a virtual thread can run on a carrier other than the
+     *        one whose poller it registered with (work stealing): its deregister in
+     *        Poller.poll's finally then runs on that other carrier, concurrently with
+     *        this carrier's poll(), so the map must be concurrent
+     */
+    public CarrierLocalPoller(boolean shared) throws IOException {
+        this.fdToThread = shared ? new ConcurrentHashMap<>() : new HashMap<>();
         this.epfd = EPoll.create();
         this.pollAddress = EPoll.allocatePollArray(MAX_EVENTS);
         this.eventfd = new EventFD();

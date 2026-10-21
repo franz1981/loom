@@ -150,7 +150,12 @@ final class MpscUnboundedQueue<E> {
         return (E) ARRAY.getAcquire(buffer, offset);
     }
 
-    void offer(E e) {
+    /**
+     * Inserts the element and returns the producer index of its slot. The consumer
+     * index equals that value exactly while the element is the next one poll() will
+     * return.
+     */
+    long offer(E e) {
         if (null == e) {
             throw new NullPointerException();
         }
@@ -178,7 +183,7 @@ final class MpscUnboundedQueue<E> {
                         continue;
                     case QUEUE_RESIZE:
                         resize(mask, buffer, pIndex, e);
-                        return;
+                        return pIndex;
                 }
             }
 
@@ -188,6 +193,7 @@ final class MpscUnboundedQueue<E> {
         }
         final int offset = modifiedCalcCircularRefElementOffset(pIndex, mask);
         soRefElement(buffer, offset, e);
+        return pIndex;
     }
 
     private int offerSlowPath(long mask, long pIndex, long producerLimit) {
@@ -286,6 +292,16 @@ final class MpscUnboundedQueue<E> {
         soRefElement(nextBuffer, offset, null);
         soConsumerIndex(index + 2);
         return n;
+    }
+
+    /**
+     * A volatile load of the consumer index. A producer that has just offered reads
+     * it to learn whether its element is at the head; paired with the consumer's
+     * fence between storing the index and reading the producer index, one of the
+     * two always sees the other.
+     */
+    long consumerIndexVolatile() {
+        return (long) CONSUMER_INDEX.getVolatile(this);
     }
 
     boolean isEmpty() {

@@ -253,6 +253,11 @@ final class VirtualThread extends BaseVirtualThread {
     // to a carrier via modulus. -1 means no affinity.
     int affinityHint = -1;
 
+    // Set by MpscVirtualThreadScheduler on start when work stealing is enabled: true
+    // if this thread's tasks go to its carrier's stealable queue, false if they must
+    // stay on the carrier (explicitly placed, or sticky).
+    boolean mpscStealable;
+
     /**
      * Returns the continuation scope used for virtual threads.
      */
