@@ -69,14 +69,26 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
      * (SEARCHING + victim id). The woken carrier steals one task from that victim,
      * hands the token to the next parked carrier if the victim still has stealable
      * work, otherwise releases it, and then runs the task. A carrier about to park
-     * also takes one task from any running carrier's stealable queue.
+     * also looks at every running carrier's stealable queue and may take one task.
      *
-     * The facts are observed at three places, so that no stealable task can sit in a
-     * running carrier's queue without some signal having been attempted for it:
-     * a producer whose task lands at the head of a running carrier's stealable queue
-     * (the queue went empty to non-empty); a consumer -- owner or thief -- that takes
-     * a task and leaves more behind; and a searcher releasing the token, which
-     * rescans once because signals were refused while it held it.
+     * Locality gate. A thief takes a task only if some task that was already queued
+     * at its previous look at that victim is still queued now: the work has waited
+     * across an interval of the thief's own activity (for a searcher, the interval is
+     * its wake, and the previous look is the signaller's). This is the two-look rule
+     * of Shenango's congestion detection with the clock taken out; it reads only the
+     * victim's head and tail indices, says nothing about the owner's load, and lets an
+     * owner that keeps up with its queue keep its tasks. A look that refuses records
+     * the tail for the next one, and marks the victim so that its own "left behind"
+     * signals stop until it sees its stealable queue empty, so refusals cannot turn
+     * into a stream of wakes.
+     *
+     * The facts are observed at three places: a remote producer whose task lands at
+     * the head of a running carrier's stealable queue (the queue went empty to
+     * non-empty); a consumer -- owner or thief -- that takes a task and leaves more
+     * behind; and a searcher releasing the token after a successful steal, which
+     * rescans once because signals were refused while it held it. A carrier
+     * enqueueing to itself sends no signal: the owner gets its chance first, and its
+     * own take of an earlier task is what signals for the ones behind it.
      */
     static final boolean STEAL = Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
 
@@ -128,7 +140,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         }
         this.carriers = new CarrierThread[parallelism];
         for (int i = 0; i < parallelism; i++) {
-            carriers[i] = new CarrierThread(i, this);
+            carriers[i] = new CarrierThread(i, this, parallelism);
         }
         this.externalStats = STEAL_STATS ? new AtomicLongArray(Stat.COUNT) : null;
         if (STEAL_STATS) {
@@ -226,9 +238,11 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
             if (Thread.currentCarrierThread() != carrier) {
                 wake(carrier);
             }
-        } else if (state != CarrierThread.RUNNING && Thread.currentCarrierThread() == carrier) {
-            // SEARCHING, seen from inside the carrier's own blocking poll: it is already
-            // woken and drains this queue once it has searched
+        } else if (Thread.currentCarrierThread() == carrier) {
+            // Local first: the carrier enqueued for itself (a child it started, a
+            // continuation it triggered, or -- in SEARCHING -- a readiness unpark
+            // inside its own poll). No signal; its own take of the task ahead of this
+            // one, or of this one, is the leftBehind() that signals for the rest.
         } else if (q.consumerIndexVolatile() == index) {
             count(Stat.SIGNAL_AT_HEAD);
             signalWork(carrier, true);
@@ -243,7 +257,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
     void signalWork(CarrierThread victim, boolean rescan) {
         count(Stat.SIGNAL_ATTEMPT);
         if (parkedCount == 0) {
-            count(Stat.SIGNAL_NO_PARKED);
+            count(Stat.SIGNAL_NO_PARKED_PRE);
             return;
         }
         if (searching != 0 || !SEARCH_TOKEN.compareAndSet(this, 0, 1)) {
@@ -254,7 +268,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         if (wakeSearcher(victim)) {
             return;
         }
-        count(Stat.SIGNAL_NO_PARKED);
+        count(Stat.SIGNAL_NO_PARKED_POST);
         releaseToken(rescan);
     }
 
@@ -269,8 +283,16 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         int n = carriers.length;
         for (int i = 1; i < n; i++) {
             CarrierThread c = carriers[(victim.id + i) % n];
-            if (c.carrierState == CarrierThread.PARKED
-                    && CarrierThread.STATE.compareAndSet(c, CarrierThread.PARKED,
+            if (c.carrierState != CarrierThread.PARKED) {
+                continue;
+            }
+            // the signaller's look, read by c after the getAndSet in leaveParked; a
+            // write to a carrier whose CAS then fails is never read
+            c.searchTail = victim.stealQueue.tailIndex();
+            if (STEAL_STATS) {
+                c.searchSignalNanos = System.nanoTime();
+            }
+            if (CarrierThread.STATE.compareAndSet(c, CarrierThread.PARKED,
                                                          CarrierThread.SEARCHING + victim.id)) {
                 count(Stat.SEARCHER_WOKEN);
                 wake(c);
@@ -323,7 +345,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         static final int SIGNAL_LEFT_BEHIND = 1;
         static final int SIGNAL_RESCAN = 2;
         static final int SIGNAL_ATTEMPT = 3;
-        static final int SIGNAL_NO_PARKED = 4;
+        static final int SIGNAL_NO_PARKED_PRE = 4;
         static final int SIGNAL_TOKEN_BUSY = 5;
         static final int TOKEN_ACQUIRED = 6;
         static final int TOKEN_RELEASED = 7;
@@ -335,12 +357,25 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         static final int STOLEN = 13;
         static final int RELOCATED = 14;
         static final int STEAL_LOCK_BUSY = 15;
-        static final int COUNT = 16;
+        static final int SIGNAL_NO_PARKED_POST = 16;
+        static final int SIGNAL_SUPPRESSED = 17;
+        static final int SEARCH_REFUSED = 18;
+        static final int SEARCH_ZERO_GAP = 19;
+        static final int PREPARK_REFUSED = 20;
+        static final int MARKED = 21;
+        // searcher wake latency, signal to search: <1us, <10us, <100us, >=100us
+        static final int WAKE_LT_1US = 22;
+        static final int WAKE_LT_10US = 23;
+        static final int WAKE_LT_100US = 24;
+        static final int WAKE_GE_100US = 25;
+        static final int COUNT = 26;
         static final String[] NAMES = {
             "signalAtHead", "signalLeftBehind", "signalRescan", "signalAttempt",
-            "signalNoParked", "signalTokenBusy", "tokenAcquired", "tokenReleased",
+            "signalNoParkedPre", "signalTokenBusy", "tokenAcquired", "tokenReleased",
             "searcherWoken", "searchFound", "searchEmpty", "chain", "preParkFound",
-            "stolen", "relocated", "stealLockBusy"
+            "stolen", "relocated", "stealLockBusy", "signalNoParkedPost",
+            "signalSuppressed", "searchRefused", "searchZeroGap", "preParkRefused",
+            "marked", "wakeLt1us", "wakeLt10us", "wakeLt100us", "wakeGe100us"
         };
     }
 
@@ -425,9 +460,6 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         // with the searcher token; consumed by the getAndSet in leaveParked()
         static final int SEARCHING = 2;
 
-        // how long a thief spins on a victim's steal lock before giving up
-        private static final int STEAL_LOCK_SPINS = 64;
-
         static final VarHandle STATE;
         private static final VarHandle STEAL_LOCK;
         static {
@@ -451,6 +483,22 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         // STEAL_STATS only: written by this carrier thread only
         final long[] stats = STEAL_STATS ? new long[Stat.COUNT] : null;
 
+        // STEAL only, this carrier as thief: the victim tail index at its previous
+        // look at each carrier (0 = none; a tail of 0 has nothing queued before it)
+        private final long[] lastSeenTail;
+
+        // STEAL only, this carrier as searcher: the victim tail at the signaller's
+        // look, written by the waker before its PARKED -> SEARCHING CAS
+        long searchTail;
+        long searchSignalNanos;
+
+        // STEAL only, this carrier as victim: set by a thief whose look refused, i.e.
+        // saw everything queued at its previous look already taken; leftBehind() then
+        // stops signalling until this carrier's own poll finds its stealable queue
+        // empty
+        @Contended("stealLock")
+        volatile boolean refusedMark;
+
         // carrier-local poller (Mode 4), null if using Mode 3 or lower
         CarrierLocalPoller poller;
 
@@ -461,10 +509,11 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         @Contended("stealLock")
         volatile int stealLock;
 
-        CarrierThread(int id, MpscVirtualThreadScheduler scheduler) {
+        CarrierThread(int id, MpscVirtualThreadScheduler scheduler, int parallelism) {
             super(null, null, "mpsc-carrier-" + id, 0, false);
             this.id = id;
             this.scheduler = scheduler;
+            this.lastSeenTail = STEAL ? new long[parallelism] : null;
             setDaemon(true);
         }
 
@@ -622,7 +671,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                 try {
                     poller.poll(-1);
                 } catch (IOException e) { }
-                leaveParked();
+                leaveParked(true);
             }
         }
 
@@ -639,7 +688,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                 }
 
                 LockSupport.park();
-                leaveParked();
+                leaveParked(true);
             }
         }
 
@@ -677,13 +726,13 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                 task = pollStealable();
             }
             if (task != null) {
-                leaveParked();
+                leaveParked(false);
                 try { task.run(); } catch (Throwable t) { }
                 return true;
             }
-            CarrierThread victim = scheduler.findStealable(this);
+            CarrierThread victim = pickVictim();
             if (victim != null) {
-                leaveParked();
+                leaveParked(false);
                 task = victim.trySteal();
                 if (task != null) {
                     scheduler.count(Stat.PREPARK_FOUND);
@@ -693,6 +742,48 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
                 return true;
             }
             return false;
+        }
+
+        /**
+         * Looks at every other running carrier with stealable work, records each one's
+         * tail for the next look, and returns the first whose work has waited since
+         * this carrier's previous look at it (see STEAL), or null.
+         */
+        private CarrierThread pickVictim() {
+            var carriers = scheduler.carriers;
+            int n = carriers.length;
+            CarrierThread found = null;
+            for (int i = 1; i < n; i++) {
+                CarrierThread c = carriers[(id + i) % n];
+                if (c.carrierState != RUNNING) {
+                    continue;
+                }
+                var q = c.stealQueue;
+                long head = q.headIndex();
+                long tail = q.tailIndex();
+                if (head == tail) {
+                    continue;
+                }
+                long seen = lastSeenTail[c.id];
+                lastSeenTail[c.id] = tail;
+                if (found == null && seen > head) {
+                    found = c;
+                } else if (found == null) {
+                    scheduler.count(Stat.PREPARK_REFUSED);
+                    if (seen != 0) {
+                        c.mark();
+                    }
+                }
+            }
+            return found;
+        }
+
+        /** As victim: a thief's look refused; see refusedMark. */
+        void mark() {
+            if (!refusedMark) {
+                refusedMark = true;
+                scheduler.count(Stat.MARKED);
+            }
         }
 
         private void enterParked() {
@@ -707,11 +798,23 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
          * getAndSet sees that whichever way the carrier leaves, so the token cannot
          * be lost.
          */
-        private void leaveParked() {
+        private void leaveParked(boolean blocked) {
             int prev = (int) STATE.getAndSet(this, RUNNING);
             PARKED_COUNT.getAndAdd(scheduler, -1);
             if (prev >= SEARCHING) {
-                search(scheduler.carriers[prev - SEARCHING]);
+                CarrierThread victim = scheduler.carriers[prev - SEARCHING];
+                if (blocked) {
+                    search(victim);
+                } else {
+                    // Moved to SEARCHING before it blocked: no wake ran between the
+                    // signaller's look and this one, so there is no interval to judge
+                    // by. Keep the signaller's look as this carrier's previous look.
+                    scheduler.count(Stat.SEARCH_ZERO_GAP);
+                    if (searchTail > lastSeenTail[victim.id]) {
+                        lastSeenTail[victim.id] = searchTail;
+                    }
+                    scheduler.releaseToken(false);
+                }
             }
         }
 
@@ -721,10 +824,32 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
          * otherwise releases it, then runs the task.
          */
         private void search(CarrierThread victim) {
+            if (STEAL_STATS) {
+                long ns = System.nanoTime() - searchSignalNanos;
+                scheduler.count(ns < 1_000 ? Stat.WAKE_LT_1US
+                        : ns < 10_000 ? Stat.WAKE_LT_10US
+                        : ns < 100_000 ? Stat.WAKE_LT_100US : Stat.WAKE_GE_100US);
+            }
+            var q = victim.stealQueue;
+            long seen = searchTail;
+            if (victim.carrierState != RUNNING || q.headIndex() >= seen) {
+                // everything queued at the signal has been taken during the wake, or
+                // the victim parked (it drains its own queue): refuse, no rescan
+                scheduler.count(Stat.SEARCH_REFUSED);
+                lastSeenTail[victim.id] = q.tailIndex();
+                victim.mark();
+                scheduler.releaseToken(false);
+                return;
+            }
+            // the signaller's look becomes this carrier's previous look at the victim,
+            // so its pre-park look after running the stolen task can judge by it
+            if (seen > lastSeenTail[victim.id]) {
+                lastSeenTail[victim.id] = seen;
+            }
             VirtualThreadTask task = victim.trySteal();
             if (task == null) {
                 scheduler.count(Stat.SEARCH_EMPTY);
-                scheduler.releaseToken(true);
+                scheduler.releaseToken(false);
                 return;
             }
             scheduler.count(Stat.SEARCH_FOUND);
@@ -755,6 +880,8 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
             STEAL_LOCK.setRelease(this, 0);
             if (task != null) {
                 leftBehind();
+            } else if (refusedMark) {
+                refusedMark = false;
             }
             return task;
         }
@@ -768,12 +895,10 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
             if (q.isEmpty()) {
                 return null;
             }
-            for (int spins = 0; !STEAL_LOCK.compareAndSet(this, 0, 1); ) {
-                if (++spins > STEAL_LOCK_SPINS) {
-                    scheduler.count(Stat.STEAL_LOCK_BUSY);
-                    return null;
-                }
-                Thread.onSpinWait();
+            // try once: a held lock means a consumer is taking right now
+            if (!STEAL_LOCK.compareAndSet(this, 0, 1)) {
+                scheduler.count(Stat.STEAL_LOCK_BUSY);
+                return null;
             }
             VirtualThreadTask task = q.poll();
             STEAL_LOCK.setRelease(this, 0);
@@ -791,6 +916,10 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
         void leftBehind() {
             VarHandle.fullFence();
             if (!stealQueue.isEmpty()) {
+                if (refusedMark) {
+                    scheduler.count(Stat.SIGNAL_SUPPRESSED);
+                    return;
+                }
                 scheduler.count(Stat.SIGNAL_LEFT_BEHIND);
                 scheduler.signalWork(this, true);
             }

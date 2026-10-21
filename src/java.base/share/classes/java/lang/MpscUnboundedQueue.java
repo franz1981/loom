@@ -304,6 +304,21 @@ final class MpscUnboundedQueue<E> {
         return (long) CONSUMER_INDEX.getVolatile(this);
     }
 
+    /**
+     * The index one past the last element offered so far, counting an element whose
+     * offer is in progress through a resize. Elements with index below it and at or
+     * above the consumer index are queued.
+     */
+    long tailIndex() {
+        long pIndex = lvProducerIndex();
+        return pIndex + (pIndex & RESIZE_BIT);
+    }
+
+    /** The index of the next element poll() will return. */
+    long headIndex() {
+        return lvConsumerIndex();
+    }
+
     boolean isEmpty() {
         long cIndex = lvConsumerIndex();
         long pIndex = lvProducerIndex();
