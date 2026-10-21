@@ -104,6 +104,14 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
     static final boolean STEAL_RELOCATE =
             Boolean.getBoolean("jdk.virtualThreadScheduler.mpscStealRelocate");
 
+    /**
+     * With STEAL, diagnostic: whether a refused look marks the victim (default true).
+     * Off, only the searcher token and the emptiness checks bound signalling, as in
+     * the Netty scheduler's nSearching chain.
+     */
+    static final boolean STEAL_MARK = !"false".equals(
+            System.getProperty("jdk.virtualThreadScheduler.mpscStealMark"));
+
     /** With STEAL: count steal events and print them at exit (stable key=value lines). */
     static final boolean STEAL_STATS =
             Boolean.getBoolean("jdk.virtualThreadScheduler.mpscStealStats");
@@ -780,7 +788,7 @@ final class MpscVirtualThreadScheduler implements VirtualThreadScheduler {
 
         /** As victim: a thief's look refused; see refusedMark. */
         void mark() {
-            if (!refusedMark) {
+            if (STEAL_MARK && !refusedMark) {
                 refusedMark = true;
                 scheduler.count(Stat.MARKED);
             }
