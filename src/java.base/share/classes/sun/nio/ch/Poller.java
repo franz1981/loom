@@ -581,13 +581,8 @@ public abstract class Poller {
             this.readPollers = readPollers;
             this.writePollers = writePollers;
 
-            // A group spreads the sub-pollers across carriers. Without it a scheduler
-            // that places by caller-carrier or by a probe hash puts every sub-poller
-            // created from this one factory on a single carrier, which a scheduler
-            // without work stealing never corrects.
             ThreadFactory factory = Thread.ofVirtual()
                     .inheritInheritableThreadLocals(false)
-                    .affinity(Thread.Affinity.newGroup())
                     .name("SubPoller-", 0)
                     .uncaughtExceptionHandler((_, e) -> e.printStackTrace())
                     .factory();
@@ -716,7 +711,6 @@ public abstract class Poller {
             Thread carrier = JLA.currentCarrierThread();
             Thread.Builder.OfVirtual builder = Thread.ofVirtual()
                     .inheritInheritableThreadLocals(false)
-                    .stickyAffinity()
                     .name(carrier.getName() + "-Read-Poller")
                     .uncaughtExceptionHandler((_, e) -> e.printStackTrace());
             Thread thread = JLA.defaultVirtualThreadScheduler()

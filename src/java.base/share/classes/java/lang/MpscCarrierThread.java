@@ -515,7 +515,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     private void runStolen(VirtualThreadTask task) {
-        // before the run, so that a sticky wakeup during it can set a newer home
+        // before the run: the thread may park during it, and its wakeup goes to its home
         setHome(task, stealableHome);
         run(task);
     }

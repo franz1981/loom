@@ -35,11 +35,10 @@ import sun.nio.ch.LocalPollers;
  * A virtual thread scheduler with one MPSC queue per carrier (MpscCarrierThread).
  *
  * <p>Each virtual thread has a home, a carrier and one of its queues, set on start
- * and used by every continuation. A placed thread (affinity, or a preferred carrier of
- * this scheduler) stays on its carrier's pinned queue for life. An unplaced thread
+ * and used by every continuation. A placed thread (a preferred carrier of this
+ * scheduler) stays on its carrier's pinned queue for life. An unplaced thread
  * starts on the starting carrier or, from a platform thread, on the carrier that
- * thread's stable probe picks; a sticky submission (submitLocal) moves it to the
- * caller's carrier. Placement beats sticky.
+ * thread's stable probe picks.
  *
  * <p>Mode 4 (CARRIER_LOCAL_POLLER) is the default where available (Linux, with
  * continuations, jdk.pollerMode unset or 4): each carrier owns a LocalPoller that VT
@@ -149,10 +148,8 @@ final class MpscVirtualThreadScheduler
     }
 
     @Override
-    public VirtualThread.VThreadTask newTask(VirtualThread vthread, int placement, Thread preferredCarrier) {
-        if (placement < 0 && preferredCarrier instanceof MpscCarrierThread ct && ct.belongsTo(this)) {
-            placement = ct.id;
-        }
+    public VirtualThread.VThreadTask newTask(VirtualThread vthread, Thread preferredCarrier) {
+        int placement = (preferredCarrier instanceof MpscCarrierThread ct && ct.belongsTo(this)) ? ct.id : -1;
         return new MpscTask(vthread, placement);
     }
 
@@ -161,10 +158,6 @@ final class MpscVirtualThreadScheduler
     private int placement(VirtualThreadTask task) {
         if (task instanceof MpscTask t) {
             return t.placement;
-        }
-        Thread.Affinity affinity = task.affinity();
-        if (affinity != null) {
-            return affinity.index;
         }
         return (task.preferredCarrier() instanceof MpscCarrierThread ct && ct.belongsTo(this)) ? ct.id : -1;
     }
@@ -214,21 +207,6 @@ final class MpscVirtualThreadScheduler
         }
     }
 
-    @Override
-    public boolean submitLocal(VirtualThread.VThreadTask task) {
-        if (!(Thread.currentCarrierThread() instanceof MpscCarrierThread c)
-                || !c.belongsTo(this)
-                || placement(task) >= 0) {
-            return false;
-        }
-        Home home = c.unplacedHome();
-        if (home(task) != home) {
-            setHome(task, home);
-        }
-        home.submit(task);
-        return true;
-    }
-
     private MpscCarrierThread carrierFor() {
         Thread caller = Thread.currentCarrierThread();
         if (caller instanceof MpscCarrierThread ct && ct.belongsTo(this)) {
@@ -245,7 +223,7 @@ final class MpscVirtualThreadScheduler
     /**
      * Stable for the calling platform thread's life, as ForkJoinPool's probe: a burst
      * then wakes its carrier once and finds it RUNNING after, where rotating would find
-     * a parked carrier nearly every time. Threads wanting spread use an affinity group.
+     * a parked carrier nearly every time.
      */
     private static int probe() {
         Thread t = Thread.currentThread();

@@ -96,7 +96,7 @@ final class CarrierLocalPoller implements LocalPoller {
      * Deregister a file descriptor if the given thread's registration is still in
      * place, i.e. it was unparked by something other than I/O readiness (interrupt,
      * timeout). May be called from any carrier: the thread may run elsewhere by the
-     * time it deregisters (work stealing, a sticky wakeup).
+     * time it deregisters (work stealing).
      */
     @Override
     public void deregister(int fdVal, Thread thread) {

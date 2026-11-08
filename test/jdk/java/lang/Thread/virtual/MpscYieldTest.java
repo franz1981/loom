@@ -83,6 +83,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import jdk.test.lib.thread.VThreadPinner;
@@ -114,6 +115,31 @@ class MpscYieldTest {
         }
     }
 
+    /**
+     * Returns a carrier of the scheduler, read from a virtual thread.
+     */
+    private static Thread aCarrier() throws InterruptedException {
+        AtomicReference<Thread> carrier = new AtomicReference<>();
+        Thread.ofVirtual().start(() -> carrier.set(VThreadScheduler.currentCarrierThread())).join();
+        return carrier.get();
+    }
+
+    /**
+     * Returns an unstarted virtual thread placed on the given carrier, its preferred
+     * carrier.
+     */
+    private static Thread placed(Thread carrier, Runnable task) {
+        return VThreadScheduler.defaultScheduler()
+                .newThread(Thread.ofVirtual(), carrier, task)
+                .thread();
+    }
+
+    private static Thread startPlaced(Thread carrier, Runnable task) {
+        Thread t = placed(carrier, task);
+        t.start();
+        return t;
+    }
+
     private static void joinAll(List<Thread> threads) throws InterruptedException {
         for (Thread t : threads) {
             t.join();
@@ -121,17 +147,17 @@ class MpscYieldTest {
     }
 
     /**
-     * Placed yielders sharing one affinity complete, each yield returns, and all of
-     * them stay on one carrier.
+     * Placed yielders sharing one carrier complete, each yield returns, and all of
+     * them stay on that carrier.
      */
     @Test
     void testPlacedYielders() throws Exception {
-        Thread.Affinity home = Thread.Affinity.newGroup().newAffinity();
+        Thread home = aCarrier();
         Set<Thread> carriers = ConcurrentHashMap.newKeySet();
         AtomicInteger yields = new AtomicInteger();
         var threads = new ArrayList<Thread>();
         for (int k = 0; k < 8; k++) {
-            threads.add(Thread.ofVirtual().affinity(home).start(() -> {
+            threads.add(startPlaced(home, () -> {
                 for (int i = 0; i < YIELDS; i++) {
                     carriers.add(VThreadScheduler.currentCarrierThread());
                     yieldOnce(i);
@@ -141,7 +167,7 @@ class MpscYieldTest {
         }
         joinAll(threads);
         assertEquals(8 * YIELDS, yields.get());
-        assertEquals(1, carriers.size(), "carriers used: " + carriers);
+        assertEquals(Set.of(home), carriers);
     }
 
     /**
@@ -172,26 +198,19 @@ class MpscYieldTest {
     }
 
     /**
-     * Placed, unplaced and sticky yielders that also park and unpark one another, so
-     * that yields, park races, sticky wakeups and wakeups from other carriers
-     * interleave.
+     * Placed and unplaced yielders that also park and unpark one another, so that
+     * yields, park races and wakeups from other carriers interleave.
      */
     @Test
     void testYieldAndPark() throws Exception {
-        Thread.Affinity home = Thread.Affinity.newGroup().newAffinity();
+        Thread home = aCarrier();
         int n = 6;
         Thread[] ring = new Thread[n];
         AtomicInteger done = new AtomicInteger();
         AtomicBoolean stop = new AtomicBoolean();
         for (int k = 0; k < n; k++) {
             int me = k;
-            // placed, plain, and sticky (its unparks go through submitLocal)
-            Thread.Builder.OfVirtual b = switch (k % 3) {
-                case 0 -> Thread.ofVirtual().affinity(home);
-                case 1 -> Thread.ofVirtual();
-                default -> Thread.ofVirtual().stickyAffinity();
-            };
-            ring[k] = b.unstarted(() -> {
+            Runnable task = () -> {
                 for (int i = 0; i < YIELDS; i++) {
                     yieldOnce(i);
                     LockSupport.unpark(ring[(me + 1) % n]);
@@ -200,7 +219,8 @@ class MpscYieldTest {
                     }
                 }
                 done.incrementAndGet();
-            });
+            };
+            ring[k] = (k % 2 == 0) ? placed(home, task) : Thread.ofVirtual().unstarted(task);
         }
         for (Thread t : ring) {
             t.start();
@@ -231,7 +251,7 @@ class MpscYieldTest {
      */
     @Test
     void testReaderBehindYielders() throws Exception {
-        Thread.Affinity home = Thread.Affinity.newGroup().newAffinity();
+        Thread home = aCarrier();
         int messages = 200;
         try (ServerSocket listener = new ServerSocket()) {
             InetAddress lb = InetAddress.getLoopbackAddress();
@@ -242,14 +262,14 @@ class MpscYieldTest {
                 AtomicInteger received = new AtomicInteger();
                 var yielders = new ArrayList<Thread>();
                 for (int k = 0; k < 4; k++) {
-                    yielders.add(Thread.ofVirtual().affinity(home).start(() -> {
+                    yielders.add(startPlaced(home, () -> {
                         int i = 0;
                         while (!stop.get()) {
                             yieldOnce(i++);
                         }
                     }));
                 }
-                Thread reader = Thread.ofVirtual().affinity(home).start(() -> {
+                Thread reader = startPlaced(home, () -> {
                     try {
                         InputStream in = readerSide.getInputStream();
                         while (received.get() < messages) {
@@ -283,9 +303,9 @@ class MpscYieldTest {
     @Test
     void testPinnedYield() throws Exception {
         Object lock = new Object();
-        Thread.Affinity home = Thread.Affinity.newGroup().newAffinity();
-        for (Thread.Builder.OfVirtual b : List.of(Thread.ofVirtual(), Thread.ofVirtual().affinity(home))) {
-            Thread t = b.start(() -> {
+        Thread home = aCarrier();
+        for (boolean place : new boolean[] { false, true }) {
+            Runnable task = () -> {
                 for (int i = 0; i < 100; i++) {
                     int n = i;
                     Thread before = VThreadScheduler.currentCarrierThread();
@@ -296,7 +316,8 @@ class MpscYieldTest {
                     }
                     yieldOnce(i);
                 }
-            });
+            };
+            Thread t = place ? startPlaced(home, task) : Thread.ofVirtual().start(task);
             t.join();
         }
     }

@@ -96,10 +96,6 @@ class ThreadBuilders {
             }
         }
 
-        void setStickyAffinity() {
-            characteristics |= Thread.STICKY_AFFINITY;
-        }
-
         void setUncaughtExceptionHandler(UncaughtExceptionHandler ueh) {
             this.uhe = Objects.requireNonNull(ueh);
         }
@@ -213,8 +209,6 @@ class ThreadBuilders {
     static final class VirtualThreadBuilder
             extends BaseThreadBuilder implements OfVirtual {
         private Thread.VirtualThreadScheduler scheduler;
-        // Thread.Affinity, Thread.Affinity.Group or null
-        private Object affinity;
 
         VirtualThreadBuilder() {
         }
@@ -243,31 +237,12 @@ class ThreadBuilders {
             return this;
         }
 
-        @Override
-        public OfVirtual stickyAffinity() {
-            setStickyAffinity();
-            return this;
-        }
-
-        @Override
-        public OfVirtual affinity(Thread.Affinity affinity) {
-            this.affinity = Objects.requireNonNull(affinity);
-            return this;
-        }
-
-        @Override
-        public OfVirtual affinity(Thread.Affinity.Group group) {
-            this.affinity = Objects.requireNonNull(group);
-            return this;
-        }
-
         Thread unstarted(Runnable task, Thread preferredCarrier) {
             Objects.requireNonNull(task);
             var thread = newVirtualThread(scheduler,
                                           preferredCarrier,
                                           nextThreadName(),
                                           characteristics(),
-                                          affinity,
                                           task);
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
@@ -290,7 +265,7 @@ class ThreadBuilders {
         @Override
         public ThreadFactory factory() {
             return new VirtualThreadFactory(scheduler, name(), counter(), characteristics(),
-                    affinity, uncaughtExceptionHandler());
+                    uncaughtExceptionHandler());
         }
     }
 
@@ -394,24 +369,21 @@ class ThreadBuilders {
      */
     private static class VirtualThreadFactory extends BaseThreadFactory {
         private final Thread.VirtualThreadScheduler scheduler;
-        private final Object affinity;
 
         VirtualThreadFactory(Thread.VirtualThreadScheduler scheduler,
                              String name,
                              long start,
                              int characteristics,
-                             Object affinity,
                              UncaughtExceptionHandler uhe) {
             super(name, start, characteristics, uhe);
             this.scheduler = scheduler;
-            this.affinity = affinity;
         }
 
         @Override
         public Thread newThread(Runnable task) {
             Objects.requireNonNull(task);
             String name = nextThreadName();
-            Thread thread = newVirtualThread(scheduler, null, name, characteristics(), affinity, task);
+            Thread thread = newVirtualThread(scheduler, null, name, characteristics(), task);
             UncaughtExceptionHandler uhe = uncaughtExceptionHandler();
             if (uhe != null)
                 thread.uncaughtExceptionHandler(uhe);
@@ -426,10 +398,9 @@ class ThreadBuilders {
                                            Thread preferredCarrier,
                                            String name,
                                            int characteristics,
-                                           Object affinity,
                                            Runnable task) {
         if (ContinuationSupport.isSupported()) {
-            return new VirtualThread(scheduler, preferredCarrier, name, characteristics, affinity, task);
+            return new VirtualThread(scheduler, preferredCarrier, name, characteristics, task);
         } else {
             if (scheduler != null)
                 throw new UnsupportedOperationException();
@@ -438,7 +409,7 @@ class ThreadBuilders {
     }
 
     static Thread newVirtualThread(String name, int characteristics, Runnable task) {
-       return newVirtualThread(null, null, name, characteristics, null, task);
+       return newVirtualThread(null, null, name, characteristics, task);
     }
 
     /**
