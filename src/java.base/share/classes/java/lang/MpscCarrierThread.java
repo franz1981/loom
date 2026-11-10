@@ -372,20 +372,19 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private void eventLoopSteal() {
         var poller = this.poller;
         for (;;) {
-            int drained = drainRoundSteal();
+            if (pollDue()) {
+                admit();
+            }
 
-            int ioEvents = 0;
-            try {
-                ioEvents = poller.poll(0);
-            } catch (IOException e) { }
-
-            if (drained + ioEvents > 0) {
+            VirtualThreadTask task = pollShared();
+            if (task != null) {
+                run(task);
                 continue;
             }
 
-            try {
-                if (poller.poll(0) > 0) continue;
-            } catch (IOException e) { }
+            if (admit() > 0) {
+                continue;
+            }
 
             enterParked();
             if (workBeforeBlocking()) {
@@ -395,6 +394,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
             try {
                 poller.poll(-1);
             } catch (IOException e) { }
+            polled();
             leaveParked();
         }
     }
@@ -415,17 +415,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
             LockSupport.park();
             leaveParked();
         }
-    }
-
-    private int drainRoundSteal() {
-        int quota = queue.size();
-        int ran = 0;
-        VirtualThreadTask task;
-        for (int i = 0; i < quota && (task = pollShared()) != null; i++) {
-            run(task);
-            ran++;
-        }
-        return ran;
     }
 
     /**
