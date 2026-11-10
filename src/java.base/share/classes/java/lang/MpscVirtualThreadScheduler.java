@@ -60,7 +60,10 @@ import sun.nio.ch.LocalPollers;
 final class MpscVirtualThreadScheduler
         implements VirtualThread.BuiltinScheduler, LocalPoller.Scheduler {
 
-    /** Opt-in work stealing; when off, none of the code that tests it runs. */
+    /**
+     * Opt-in work stealing; when off, there is no SearchGate or IdleSet and the carriers
+     * run loops that never steal.
+     */
     static final boolean STEAL = Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
 
     private final MpscCarrierThread[] carriers;
@@ -110,7 +113,8 @@ final class MpscVirtualThreadScheduler
     }
 
     static final class MpscTask extends VirtualThread.VThreadTask {
-        // written before each offer, which publishes it to the next submitter
+        // plain: written on start before the first offer and by a thief before it runs the
+        // thread; a submitter reads it after the thread's state change that follows that run
         private MpscCarrierThread home;
 
         // link in the held yields of the carrier the thread yielded on (holdYield)
