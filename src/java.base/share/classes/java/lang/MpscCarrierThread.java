@@ -42,11 +42,14 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  *
  * <p>The carrier runs its queue as one live FIFO. In Mode 4 it polls its poller, with
  * no thread mounted, only: without blocking when its queue is empty; without blocking
- * at a task boundary once {@code jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros}
- * (default 500) has passed since its last poll, if tasks are queued and fds are
- * registered; without blocking before it queues a yielder that would be alone in its
- * queue; and blocking, on the park path. Readiness unparks threads on this carrier's
- * own thread, so they are queued here.
+ * before it runs a task it took from its queue, once
+ * {@code jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros} (default 500) has passed
+ * since its last poll, if fds are registered; without blocking before it queues a
+ * yielder that would be alone in its queue; and blocking, on the park path.
+ * Readiness unparks threads on this carrier's own thread, so they are queued here.
+ * The interval is checked only between tasks: a running task is never interrupted, so
+ * ready I/O waits up to the interval plus the task running when it expires, and that
+ * task's run time has no bound.
  *
  * <p>States of {@code carrierState}:
  * <pre>
@@ -65,9 +68,10 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>The queue is one live FIFO: a task runs after everything queued on this
  *     carrier before it, unless a thief takes it first. A runnable thread is in
  *     exactly one carrier's queue or is a task in hand; none is held aside.
- * <li>Mode 4: a fd ready on this carrier's poller is polled within the poll interval
- *     plus the task in progress, or sooner when the queue empties; a poll that fills
- *     its event array leaves the interval expired.
+ * <li>Mode 4: every task this carrier takes from its queue starts after a check of
+ *     the poll interval, so a fd ready on its poller is polled at the first task
+ *     boundary after the interval expires, or sooner when the queue empties; a poll
+ *     that fills its event array leaves the interval expired.
  * <li>With stealing, a task is announced unless it is the next task its owner runs:
  *     by its producer when that is another thread (or by the owner after WAKING, for
  *     it), else by the owner before it runs the next task.
@@ -93,7 +97,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     /**
      * Mode 4: how long a carrier whose queue does not empty runs tasks before it
-     * polls its poller, checked at task boundaries.
+     * polls its poller, checked before each task it takes from its queue.
      */
     private static final long MAX_POLL_INTERVAL_NANOS = TimeUnit.MICROSECONDS.toNanos(Math.max(0L,
             Long.getLong("jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros", 500L)));
@@ -297,12 +301,11 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         var queue = this.queue;
         var poller = this.poller;
         for (;;) {
-            if (pollDue()) {
-                admit();
-            }
-
             VirtualThreadTask task = queue.poll();
             if (task != null) {
+                if (pollDue()) {
+                    admit();
+                }
                 try { task.run(); } catch (Throwable t) { }
                 continue;
             }
@@ -327,9 +330,9 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         }
     }
 
-    /** Mode 4, at a task boundary: tasks are queued and the poll interval has passed. */
+    /** Mode 4, with a task in hand: the poll interval has passed. */
     private boolean pollDue() {
-        return hasQueued() && poller.hasRegistrations()
+        return poller.hasRegistrations()
                 && System.nanoTime() - lastPoll >= MAX_POLL_INTERVAL_NANOS;
     }
 
@@ -384,12 +387,11 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private void eventLoopSteal() {
         var poller = this.poller;
         for (;;) {
-            if (pollDue()) {
-                admit();
-            }
-
             VirtualThreadTask task = pollShared();
             if (task != null) {
+                if (pollDue()) {
+                    admit();
+                }
                 run(task);
                 continue;
             }
