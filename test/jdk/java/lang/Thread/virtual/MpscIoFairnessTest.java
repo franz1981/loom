@@ -199,6 +199,7 @@ class MpscIoFairnessTest {
                     System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
     private static final int PARALLELISM =
             Integer.getInteger("jdk.virtualThreadScheduler.parallelism");
+    private static final int POLLER_MODE = Integer.getInteger("jdk.pollerMode");
     // set by the ids that take the interval out of the way of another poll rule
     private static final Long POLL_INTERVAL_MICROS =
             Long.getLong("jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros");
@@ -664,14 +665,17 @@ class MpscIoFairnessTest {
     }
 
     /**
-     * Readiness is delivered; without stealing, or with one carrier, the thread runs
-     * on the carrier it read on, where a thief cannot take it.
+     * After a socket read the thread runs on the carrier it read on: in Mode 4 that
+     * carrier's poll finds the readiness, in Mode 1 a platform-thread poller wakes it
+     * and it goes home. Not asserted in Mode 2 with stealing on several carriers: the
+     * wake is made by a read sub-poller, a virtual thread, on whatever carrier that
+     * runs on, and the thread is queued there.
      */
     @Test
     void testReadinessStaysOnPollingCarrier() throws Exception {
         assumeDefaultPollInterval();
         Placement p = runPlacement();
-        if (!STEAL || PARALLELISM == 1) {
+        if (!(STEAL && PARALLELISM > 1 && POLLER_MODE == 2)) {
             assertSame(p.afterSleep(), p.afterRead(), p.toString());
         }
     }
