@@ -64,7 +64,8 @@ final class CarrierLocalPoller implements LocalPoller {
             address = EPoll.allocatePollArray(MAX_EVENTS);
             eventfd = new EventFD();
             IOUtil.configureBlocking(eventfd.efd(), false);
-            EPoll.ctl(epfd, EPOLL_CTL_ADD, eventfd.efd(), EPOLLIN);
+            // edge-triggered: every wakeup write is a new edge, so the counter is never read
+            EPoll.ctl(epfd, EPOLL_CTL_ADD, eventfd.efd(), EPOLLIN | EPOLLET);
         } catch (Throwable e) {
             // close what was opened, as EPollPoller does
             FileDispatcherImpl.closeIntFD(epfd);
@@ -125,9 +126,7 @@ final class CarrierLocalPoller implements LocalPoller {
         for (int i = 0; i < n; i++) {
             long eventAddress = EPoll.getEvent(pollAddress, i);
             int fd = EPoll.getDescriptor(eventAddress);
-            if (fd == eventfd.efd()) {
-                eventfd.reset();
-            } else {
+            if (fd != eventfd.efd()) {
                 Thread vt = fdToThread.take(fd);
                 if (vt != null) {
                     LockSupport.unpark(vt);
