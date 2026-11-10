@@ -36,9 +36,10 @@ import static sun.nio.ch.EPoll.*;
  * one instance. VTs that park on I/O register their fd directly with the
  * carrier's epoll fd. No sub-pollers, no master poller.
  *
- * <p>The carrier calls {@link #poll(int)} when idle. When I/O arrives,
- * the blocked VTs are unparked and enqueued to the carrier's own queue.
- * External task submissions wake the carrier via the eventfd.
+ * <p>Only the owning carrier calls {@link #poll(int)}, with no thread mounted:
+ * without blocking between tasks (when the scheduler's rules say so), and blocking
+ * when it parks. The VTs whose fds are ready are unparked on the carrier's own
+ * thread. Other threads wake a blocked carrier through the eventfd.
  *
  * <p>Created only by the Linux DefaultPollerProvider; everything else uses it as a
  * LocalPoller.
