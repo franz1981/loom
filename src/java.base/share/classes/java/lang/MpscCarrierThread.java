@@ -310,7 +310,8 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
                 continue;
             }
 
-            if (admit() > 0) {
+            admit();
+            if (hasQueued()) {
                 continue;
             }
 
@@ -337,21 +338,20 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     /**
-     * Mode 4, on this carrier with no thread mounted: polls without blocking and
-     * returns the number of threads unparked. Readiness wakes this carrier's own
-     * thread, so the unparked threads are queued here.
+     * Mode 4, on this carrier with no thread mounted: polls without blocking. Readiness
+     * wakes threads on this carrier's own thread, so they are queued here, except a
+     * thread still parking on another carrier, which that carrier's resubmit queues.
+     * The caller tests its queue rather than a count of wakes.
      */
-    private int admit() {
+    private void admit() {
         // only this carrier registers, so no registration can appear during the poll
         if (!poller.hasRegistrations()) {
-            return 0;
+            return;
         }
-        int unparked = 0;
         try {
-            unparked = poller.poll(0);
+            poller.poll(0);
         } catch (IOException e) { }
         polled();
-        return unparked;
     }
 
     private void polled() {
@@ -396,7 +396,8 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
                 continue;
             }
 
-            if (admit() > 0) {
+            admit();
+            if (hasQueued()) {
                 continue;
             }
 
