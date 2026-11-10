@@ -71,6 +71,29 @@
  */
 
 /*
+ * @test id=mode2
+ * @requires vm.continuations & os.family == "linux"
+ * @modules java.base/java.lang:+open
+ * @library /test/lib
+ * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.pollerMode=2
+ *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
+ */
+
+/*
+ * @test id=mode2-steal
+ * @requires vm.continuations & os.family == "linux"
+ * @modules java.base/java.lang:+open
+ * @library /test/lib
+ * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=true
+ *                    -Djdk.pollerMode=2
+ *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
+ */
+
+/*
  * @test id=mode1
  * @requires vm.continuations
  * @modules java.base/java.lang:+open
@@ -108,6 +131,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import jdk.test.lib.thread.VThreadPinner;
@@ -337,18 +361,26 @@ class MpscYieldTest {
     @Test
     void testPinnedYield() throws Exception {
         Object lock = new Object();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
         Thread t = Thread.ofVirtual().start(() -> {
-            for (int i = 0; i < 100; i++) {
-                int n = i;
-                Thread before = currentCarrierThread();
-                VThreadPinner.runPinned(() -> yieldOnce(n));
-                assertSame(before, currentCarrierThread());
-                synchronized (lock) {
+            try {
+                for (int i = 0; i < 100; i++) {
+                    int n = i;
+                    Thread before = currentCarrierThread();
+                    VThreadPinner.runPinned(() -> yieldOnce(n));
+                    assertSame(before, currentCarrierThread());
+                    synchronized (lock) {
+                        yieldOnce(i);
+                    }
                     yieldOnce(i);
                 }
-                yieldOnce(i);
+            } catch (Throwable e) {
+                failure.set(e);
             }
         });
         t.join();
+        if (failure.get() != null) {
+            fail(failure.get());
+        }
     }
 }
