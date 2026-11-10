@@ -150,12 +150,7 @@ final class MpscUnboundedQueue<E> {
         return (E) ARRAY.getAcquire(buffer, offset);
     }
 
-    /**
-     * Inserts the element and returns the producer index of its slot. The consumer
-     * index equals that value exactly while the element is the next one poll() will
-     * return.
-     */
-    long offer(E e) {
+    void offer(E e) {
         if (null == e) {
             throw new NullPointerException();
         }
@@ -183,7 +178,7 @@ final class MpscUnboundedQueue<E> {
                         continue;
                     case QUEUE_RESIZE:
                         resize(mask, buffer, pIndex, e);
-                        return pIndex;
+                        return;
                 }
             }
 
@@ -193,7 +188,6 @@ final class MpscUnboundedQueue<E> {
         }
         final int offset = modifiedCalcCircularRefElementOffset(pIndex, mask);
         soRefElement(buffer, offset, e);
-        return pIndex;
     }
 
     private int offerSlowPath(long mask, long pIndex, long producerLimit) {
@@ -301,31 +295,6 @@ final class MpscUnboundedQueue<E> {
         soRefElement(nextBuffer, offset, null);
         soConsumerIndex(index + 2);
         return n;
-    }
-
-    /**
-     * A volatile load of the consumer index. A producer that has just offered reads
-     * it to learn whether its element is at the head; paired with the consumer's
-     * fence between storing the index and reading the producer index, one of the
-     * two always sees the other.
-     */
-    long consumerIndexVolatile() {
-        return (long) CONSUMER_INDEX.getVolatile(this);
-    }
-
-    /**
-     * The index one past the last element offered so far, counting an element whose
-     * offer is in progress through a resize. Elements with index below it and at or
-     * above the consumer index are queued.
-     */
-    long tailIndex() {
-        long pIndex = lvProducerIndex();
-        return pIndex + (pIndex & RESIZE_BIT);
-    }
-
-    /** The index of the next element poll() will return. */
-    long headIndex() {
-        return lvConsumerIndex();
     }
 
     boolean isEmpty() {
