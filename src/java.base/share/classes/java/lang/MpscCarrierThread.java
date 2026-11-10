@@ -54,13 +54,15 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>A task offered to a parked carrier is never missed, and a park costs at most
  *     one wake.
  * <li>No task runs while the state reads PARKED.
- * <li>With stealing, a stealable task is announced unless it is the next task its
- *     owner runs: by its producer when that is another thread (or by the owner after
- *     WAKING, for it), else by the owner before it runs the next task.
+ * <li>With stealing, a task is announced unless it is the next task its owner runs:
+ *     by its producer when that is another thread (or by the owner after WAKING, for
+ *     it), else by the owner before it runs the next task.
  * <li>With stealing, the owner and thieves consume the queue in turns (stealLock).
- * <li>With stealing, the owner's own thread offers stealable tasks only with no thread
- *     mounted (after a continuation unmounts, or from its polls), never from a task's
- *     code; run(task) is the only place a task runs.
+ * <li>With stealing, the owner's own thread offers tasks only with no thread mounted
+ *     (after a continuation unmounts, or from its polls), never from a task's code;
+ *     run(task) is the only place a task runs.
+ * <li>Held yields exist only without stealing, in Mode 4, and there are none
+ *     whenever the state reads PARKED.
  * </ul>
  */
 final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {

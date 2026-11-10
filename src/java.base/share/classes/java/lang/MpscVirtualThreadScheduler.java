@@ -34,28 +34,28 @@ import sun.nio.ch.LocalPollers;
 /**
  * A virtual thread scheduler with one MPSC queue per carrier (MpscCarrierThread).
  *
- * <p>Each virtual thread has a home, a carrier and one of its queues, set on start
- * and used by every continuation. A thread starts on the starting carrier or, from
- * a platform thread, on the carrier that thread's stable probe picks. A preferred
- * carrier is ignored.
+ * <p>Each virtual thread has a home, the carrier that every continuation of the
+ * thread is submitted to. It is set on start: the starting carrier or, from a
+ * platform thread, the carrier that thread's stable probe picks. A preferred carrier is
+ * ignored. Without stealing the home never changes; with {@link #STEAL} a thief
+ * becomes the home of the thread it steals.
  *
  * <p>Mode 4 (CARRIER_LOCAL_POLLER) is the default where available (Linux, with
  * continuations, jdk.pollerMode unset or 4): each carrier owns a LocalPoller that VT
- * fds register with directly, and alternates rounds of its queues with polls.
+ * fds register with directly, and alternates rounds of its queue with polls.
  * Mode 3 is not supported: jdk.pollerMode=3 falls back, with a warning, to the
  * platform's default poller mode.
  *
- * <p>A yield resubmits the thread. Without stealing, in Mode 4 a thread is held by
- * its carrier and runs at the end of the next round, after everything queued before
- * it, including what the poll woke; any other goes to the tail of its home queue. A
- * lone yielder never makes its carrier block.
+ * <p>A yield resubmits the thread. Without stealing, in Mode 4, its carrier holds it
+ * and runs it at the end of the next round, after everything queued before it,
+ * including what the poll woke. Otherwise it goes to the tail of its home queue; with
+ * stealing it is never held, as a held thread is not in the queue thieves take from.
+ * A lone yielder never makes its carrier block.
  *
- * <p>With {@link #STEAL}, every thread's home is its carrier's stealable
- * queue, and then the last carrier that took it. A producer of a stealable task wakes
- * the owner if it is parked, else signals (SearchGate); the owner announces its own
- * submissions before its next task if they are not that task, and a WAKING owner
- * announces what its waker deferred. See MpscCarrierThread for the carrier states and
- * SearchGate for the searcher token.
+ * <p>With stealing, a producer wakes the home carrier if it is parked, else signals
+ * (SearchGate); the owner announces its own submissions before its next task if they
+ * are not that task, and a WAKING owner announces what its waker deferred. See
+ * MpscCarrierThread for the carrier states and SearchGate for the searcher token.
  */
 final class MpscVirtualThreadScheduler
         implements VirtualThread.BuiltinScheduler, LocalPoller.Scheduler {
@@ -161,7 +161,6 @@ final class MpscVirtualThreadScheduler
         assert !(task instanceof MpscTask t && t.isYielded())
                 || Thread.currentThread() == home
                 : "YIELDED thread submitted by " + Thread.currentThread();
-        // never held with stealing: a held thread is not in the queue, where a thief takes it
         if (STEAL || !home.holdYield(task)) {
             home.submit(task);
         }
