@@ -183,7 +183,7 @@ class MpscIoFairnessTest {
         Thread.ofVirtual().start(() -> threads.forEach(Thread::start)).join();
     }
 
-    /** Waits until the thread is parked, e.g. blocked in a read. */
+    /** Waits until the thread is parked. */
     private static void awaitWaiting(Thread thread) throws InterruptedException {
         long deadline = System.nanoTime() + LIMIT.toNanos();
         while (thread.getState() != Thread.State.WAITING
@@ -191,6 +191,29 @@ class MpscIoFairnessTest {
             assertTrue(System.nanoTime() < deadline, thread + " did not park");
             Thread.sleep(1);
         }
+    }
+
+    /** Waits until the thread is parked in a socket read, waiting for data. */
+    private static void awaitReadPark(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + LIMIT.toNanos();
+        while (!parkedInRead(thread)) {
+            assertTrue(System.nanoTime() < deadline, thread + " did not park in a read");
+            Thread.sleep(1);
+        }
+    }
+
+    private static boolean parkedInRead(Thread thread) {
+        Thread.State state = thread.getState();
+        if (state != Thread.State.WAITING && state != Thread.State.TIMED_WAITING) {
+            return false;
+        }
+        for (StackTraceElement e : thread.getStackTrace()) {
+            if (e.getClassName().equals("sun.nio.ch.NioSocketImpl")
+                    && e.getMethodName().equals("park")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -262,7 +285,7 @@ class MpscIoFairnessTest {
                 }
             });
             startTogether(List.of(yielder, reader));
-            awaitWaiting(reader);
+            awaitReadPark(reader);
             pair.out().write(42);
             boolean served = reader.join(LIMIT);
             stop.set(true);
@@ -296,7 +319,7 @@ class MpscIoFairnessTest {
             });
             Thread[] chain = wakeChain(stop);
             startTogether(List.of(reader, chain[0], chain[1]));
-            awaitWaiting(reader);
+            awaitReadPark(reader);
             OutputStream out = pair.out();
             for (int i = 0; i < messages; i++) {
                 out.write(i);
@@ -341,7 +364,7 @@ class MpscIoFairnessTest {
             });
             Thread[] chain = wakeChain(stop);
             startTogether(List.of(reader, chain[0], chain[1]));
-            awaitWaiting(reader);
+            awaitReadPark(reader);
             long writtenAt = System.nanoTime();
             pair.out().write(42);
             boolean served = reader.join(LIMIT);
@@ -406,6 +429,7 @@ class MpscIoFairnessTest {
             try {
                 await(started, "X started");
                 awaitWaiting(x);
+                assertFalse(parkedInRead(x), "X is parked in LockSupport.park, not in a read");
                 Thread home = ranOn[0];
                 Runnable yielder = () -> {
                     while (!stop.get()) {
@@ -433,7 +457,7 @@ class MpscIoFairnessTest {
                 unparkRequested.set(true);
                 await(unparked, "X ran after the unpark");
                 await(reading, "X ran after the sleep");
-                awaitWaiting(x);
+                awaitReadPark(x);
                 pair.out().write(42);
                 assertTrue(x.join(LIMIT), "X not served within " + LIMIT);
             } finally {
