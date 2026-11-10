@@ -466,6 +466,9 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
             runStolen(task);
             return true;
         }
+        // One look only: if the victim's lock is held (its owner taking a task) or another
+        // thief emptied it first, this carrier parks. Nothing is lost, but tasks queued by
+        // other threads, there or elsewhere, can wait behind a running task until a signal.
         return false;
     }
 
