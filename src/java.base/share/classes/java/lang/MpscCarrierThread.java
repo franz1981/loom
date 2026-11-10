@@ -76,7 +76,8 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  *     by its producer when that is another thread (or by the owner after WAKING, for
  *     it), else by the owner before it runs the next task.
  * <li>With stealing the queue is shared: the owner (pollShared) and thieves
- *     (trySteal) consume it in turns under stealLock.
+ *     (trySteal) take from it concurrently; a failed claim means another consumer
+ *     took that task.
  * <li>With stealing, the owner's own thread offers tasks only with no thread mounted
  *     (after a continuation unmounts, or from its polls), never from a task's code;
  *     run(task) is the only place a task runs.
@@ -84,12 +85,10 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  */
 final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private static final VarHandle STATE;
-    private static final VarHandle STEAL_LOCK;
     static {
         try {
             MethodHandles.Lookup l = MethodHandles.lookup();
             STATE = l.findVarHandle(MpscCarrierThread.class, "carrierState", int.class);
-            STEAL_LOCK = l.findVarHandle(MpscCarrierThread.class, "stealLock", int.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -116,9 +115,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     @Contended("state")
     private volatile int carrierState;
-
-    @Contended("stealLock")
-    private volatile int stealLock;
 
     @Contended("local")
     private int xorshift;
@@ -466,9 +462,9 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
             runStolen(task);
             return true;
         }
-        // One look only: if the victim's lock is held (its owner taking a task) or another
-        // thief emptied it first, this carrier parks. Nothing is lost, but tasks queued by
-        // other threads, there or elsewhere, can wait behind a running task until a signal.
+        // One look only: if another carrier took the victim's tasks after the pick, this
+        // carrier parks; a task whose producer found no carrier idle can then wait behind a
+        // task running elsewhere until the next signal.
         return false;
     }
 
@@ -497,12 +493,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     private VirtualThreadTask pollShared() {
-        while (!STEAL_LOCK.compareAndSet(this, 0, 1)) {
-            Thread.onSpinWait();
-        }
-        VirtualThreadTask task = queue.poll();
-        STEAL_LOCK.setRelease(this, 0);
-        return task;
+        return queue.take(true);
     }
 
     // ---- The queue as other carriers and SearchGate see it ----
@@ -516,15 +507,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     private VirtualThreadTask trySteal() {
-        var q = queue;
-        if (q.isEmpty()) {
-            return null;
-        }
-        if (!STEAL_LOCK.compareAndSet(this, 0, 1)) {
-            return null;
-        }
-        VirtualThreadTask task = q.poll();
-        STEAL_LOCK.setRelease(this, 0);
-        return task;
+        return queue.take(false);
     }
 }
