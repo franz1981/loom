@@ -112,6 +112,32 @@
  *                    -Djdk.pollerMode=1
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscIoFairnessTest
  */
+
+/*
+ * @test id=mode4-one-carrier-no-interval
+ * @summary The poll interval defeated: only the tests that need no interval poll run
+ * @requires vm.continuations & os.family == "linux"
+ * @modules java.base/java.lang:+open
+ * @run junit/othervm -esa
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
+ *                    -Djdk.pollerMode=4
+ *                    -Djdk.virtualThreadScheduler.mpscMaxPollIntervalMicros=3600000000
+ *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscIoFairnessTest
+ */
+
+/*
+ * @test id=mode4-steal-one-carrier-no-interval
+ * @requires vm.continuations & os.family == "linux"
+ * @modules java.base/java.lang:+open
+ * @run junit/othervm -esa
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=true
+ *                    -Djdk.pollerMode=4
+ *                    -Djdk.virtualThreadScheduler.mpscMaxPollIntervalMicros=3600000000
+ *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscIoFairnessTest
+ */
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -137,6 +163,7 @@ import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class MpscIoFairnessTest {
     // a hang fails by this limit, well inside the jtreg timeout
@@ -146,6 +173,14 @@ class MpscIoFairnessTest {
                     System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
     private static final int PARALLELISM =
             Integer.getInteger("jdk.virtualThreadScheduler.parallelism");
+    // set by the ids that take the interval out of the way of another poll rule
+    private static final Long POLL_INTERVAL_MICROS =
+            Long.getLong("jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros");
+
+    /** For tests that a carrier passes only by polling when the interval expires. */
+    private static void assumeDefaultPollInterval() {
+        assumeTrue(POLL_INTERVAL_MICROS == null, "needs the default poll interval");
+    }
 
     @BeforeAll
     static void assertionsEnabled() throws Exception {
@@ -294,7 +329,8 @@ class MpscIoFairnessTest {
 
     /**
      * A thread that yields in a loop, alone in its carrier's queue, does not keep a
-     * reader started with it from receiving.
+     * reader started with it from receiving. With one carrier and the poll interval
+     * defeated, only the poll before a lone yielder is requeued serves the reader.
      */
     @Test
     void testLoneYielderDoesNotStarveReader() throws Exception {
@@ -334,6 +370,7 @@ class MpscIoFairnessTest {
      */
     @Test
     void testWakeChainDoesNotStarveReader() throws Exception {
+        assumeDefaultPollInterval();
         int messages = 200;
         try (SocketPair pair = SocketPair.open()) {
             AtomicBoolean stop = new AtomicBoolean();
@@ -381,6 +418,7 @@ class MpscIoFairnessTest {
      */
     @Test
     void testReadTimeoutNotSpurious() throws Exception {
+        assumeDefaultPollInterval();
         int timeoutMillis = 2_000;
         try (SocketPair pair = SocketPair.open()) {
             pair.readerSide().setSoTimeout(timeoutMillis);
@@ -514,6 +552,7 @@ class MpscIoFairnessTest {
      */
     @Test
     void testVtWakePlacement() throws Exception {
+        assumeDefaultPollInterval();
         Placement p = runPlacement();
         if (STEAL) {
             assertSame(p.waker(), p.afterUnpark(), p.toString());
@@ -527,6 +566,7 @@ class MpscIoFairnessTest {
      */
     @Test
     void testTimerWakeGoesToLastCarrier() throws Exception {
+        assumeDefaultPollInterval();
         Placement p = runPlacement();
         assertSame(p.afterUnpark(), p.afterSleep(), p.toString());
         if (STEAL) {
@@ -542,6 +582,7 @@ class MpscIoFairnessTest {
      */
     @Test
     void testReadinessStaysOnPollingCarrier() throws Exception {
+        assumeDefaultPollInterval();
         Placement p = runPlacement();
         if (!STEAL || PARALLELISM == 1) {
             assertSame(p.afterSleep(), p.afterRead(), p.toString());
