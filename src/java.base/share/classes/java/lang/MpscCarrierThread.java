@@ -409,7 +409,9 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     private void plainLoopSteal() {
         for (;;) {
-            if (drainRoundSteal() > 0) {
+            VirtualThreadTask task = pollShared();
+            if (task != null) {
+                run(task);
                 continue;
             }
 
