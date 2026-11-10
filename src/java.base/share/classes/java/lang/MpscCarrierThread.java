@@ -25,7 +25,6 @@
 package java.lang;
 
 import java.io.IOException;
-import java.lang.MpscVirtualThreadScheduler.Home;
 import java.lang.MpscVirtualThreadScheduler.MpscTask;
 import java.lang.Thread.VirtualThreadTask;
 import java.lang.invoke.MethodHandles;
@@ -82,8 +81,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private final MpscVirtualThreadScheduler scheduler;
     private final IdleSet idleSet;
     private final SearchGate gate;
-    private final Home pinnedHome = new Home(this, false);
-    private final Home stealableHome = STEAL ? new Home(this, true) : null;
 
     private final MpscUnboundedQueue<VirtualThreadTask> stealQueue =
             STEAL ? new MpscUnboundedQueue<>(64) : null;
@@ -189,7 +186,15 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     // ---- Used by the scheduler and SearchGate ----
 
-    void offer(VirtualThreadTask task) {
+    void submit(VirtualThreadTask task) {
+        if (STEAL) {
+            offerStealable(task);
+        } else {
+            offer(task);
+        }
+    }
+
+    private void offer(VirtualThreadTask task) {
         queue.offer(task);
         if (carrierState == PARKED) {
             // readiness from this carrier's own blocking poll, which drains on return
@@ -200,7 +205,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         }
     }
 
-    void offerStealable(VirtualThreadTask task) {
+    private void offerStealable(VirtualThreadTask task) {
         stealQueue.offer(task);
         if (Thread.currentThread() == this) {
             unannounced = true;
@@ -214,10 +219,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         } else if (state != WAKING) {
             gate.signal(this);
         }
-    }
-
-    Home unplacedHome() {
-        return STEAL ? stealableHome : pinnedHome;
     }
 
     boolean belongsTo(MpscVirtualThreadScheduler s) {
@@ -512,7 +513,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     private void runStolen(VirtualThreadTask task) {
         // before the run: the thread may park during it, and its wakeup goes to its home
-        setHome(task, stealableHome);
+        setHome(task, this);
         run(task);
     }
 

@@ -109,32 +109,9 @@ final class MpscVirtualThreadScheduler
         }
     }
 
-    static final class Home {
-        private final MpscCarrierThread carrier;
-        private final boolean stealable;
-
-        Home(MpscCarrierThread carrier, boolean stealable) {
-            this.carrier = carrier;
-            this.stealable = stealable;
-        }
-
-        /** Never for a stealable home, whose thread must stay where a thief can take it. */
-        boolean holdYield(VirtualThreadTask task) {
-            return !(STEAL && stealable) && carrier.holdYield(task);
-        }
-
-        private void submit(VirtualThreadTask task) {
-            if (STEAL && stealable) {
-                carrier.offerStealable(task);
-            } else {
-                carrier.offer(task);
-            }
-        }
-    }
-
     static final class MpscTask extends VirtualThread.VThreadTask {
         // written before each offer, which publishes it to the next submitter
-        private Home home;
+        private MpscCarrierThread home;
 
         // link in the held yields of the carrier the thread yielded on (holdYield)
         MpscTask nextYielded;
@@ -151,14 +128,14 @@ final class MpscVirtualThreadScheduler
 
     // A custom scheduler's task keeps its home in builtinState.
 
-    private static Home home(VirtualThreadTask task) {
+    private static MpscCarrierThread home(VirtualThreadTask task) {
         if (task instanceof MpscTask t) {
             return t.home;
         }
-        return (Home) ((VirtualThread.CustomVThreadTask) task).builtinState;
+        return (MpscCarrierThread) ((VirtualThread.CustomVThreadTask) task).builtinState;
     }
 
-    static void setHome(VirtualThreadTask task, Home home) {
+    static void setHome(VirtualThreadTask task, MpscCarrierThread home) {
         if (task instanceof MpscTask t) {
             t.home = home;
         } else {
@@ -168,23 +145,24 @@ final class MpscVirtualThreadScheduler
 
     @Override
     public void onStart(VirtualThreadTask task) {
-        Home home = carrierFor().unplacedHome();
+        MpscCarrierThread home = carrierFor();
         setHome(task, home);
         home.submit(task);
     }
 
     @Override
     public void onContinue(VirtualThreadTask task) {
-        Home home = home(task);
+        MpscCarrierThread home = home(task);
         if (home == null) {
             onStart(task);
             return;
         }
         // holdYield relies on this
         assert !(task instanceof MpscTask t && t.isYielded())
-                || Thread.currentThread() == home.carrier
+                || Thread.currentThread() == home
                 : "YIELDED thread submitted by " + Thread.currentThread();
-        if (!home.holdYield(task)) {
+        // never held with stealing: a held thread is not in the queue, where a thief takes it
+        if (STEAL || !home.holdYield(task)) {
             home.submit(task);
         }
     }
