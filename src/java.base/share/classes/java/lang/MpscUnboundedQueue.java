@@ -28,9 +28,26 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import jdk.internal.vm.annotation.Contended;
 
+import static java.lang.MpscVirtualThreadScheduler.STEAL;
+
 /**
- * Multi-Producer Single-Consumer unbounded array queue using VarHandles.
- * Based on JCTools MpscUnboundedArrayQueue but self-contained.
+ * Multi-producer unbounded array queue using VarHandles, based on JCTools
+ * MpscUnboundedArrayQueue but self-contained. Without stealing it has one consumer,
+ * which calls {@link #poll()}. With {@link MpscVirtualThreadScheduler#STEAL} any number
+ * of consumers call {@link #take(boolean)}: a consumer claims an element by a CAS on the
+ * consumer index and then clears its slot. The two are never mixed on one queue.
+ *
+ * <p>Memory order: a write in release mode or stronger, read by a read in acquire mode
+ * or stronger, is taken to give happens-before between them (the VarHandle access-mode
+ * convention).
+ *
+ * <p>Invariants with stealing:
+ * <ul>
+ * <li>A lost claim CAS means another consumer took that index.
+ * <li>A slot is written only when it is clear: an offer waits for the clear of the
+ *     consumer that claimed that slot's element one lap back.
+ * <li>A claim trusts a slot only below a producer index it observed.
+ * </ul>
  *
  * @param <E> the type of elements held in this queue
  */
@@ -39,6 +56,7 @@ final class MpscUnboundedQueue<E> {
     private static final VarHandle PRODUCER_INDEX;
     private static final VarHandle CONSUMER_INDEX;
     private static final VarHandle PRODUCER_LIMIT;
+    private static final VarHandle CONSUMER_BUFFER;
     private static final VarHandle ARRAY;
 
     static {
@@ -47,6 +65,7 @@ final class MpscUnboundedQueue<E> {
             PRODUCER_INDEX = lookup.findVarHandle(MpscUnboundedQueue.class, "producerIndex", long.class);
             CONSUMER_INDEX = lookup.findVarHandle(MpscUnboundedQueue.class, "consumerIndex", long.class);
             PRODUCER_LIMIT = lookup.findVarHandle(MpscUnboundedQueue.class, "producerLimit", long.class);
+            CONSUMER_BUFFER = lookup.findVarHandle(MpscUnboundedQueue.class, "consumerBuffer", Object[].class);
             ARRAY = MethodHandles.arrayElementVarHandle(Object[].class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
@@ -81,6 +100,9 @@ final class MpscUnboundedQueue<E> {
     private long consumerMask;
     @Contended("consumer")
     private E[] consumerBuffer;
+    // take(true) only, on the queue's carrier: a producer index it read
+    @Contended("consumer")
+    private long ownerProducerIndex;
 
     MpscUnboundedQueue(int initialCapacity) {
         if (initialCapacity < 2) {
@@ -168,6 +190,17 @@ final class MpscUnboundedQueue<E> {
 
             mask = this.producerMask;
             buffer = this.producerBuffer;
+
+            // With stealing, the consumer that took this slot's element one lap back clears it
+            // after its claim: never write over it, or that clear erases this element. Keep the
+            // check before the limit test: it also guards the slot that receives JUMP on a resize,
+            // which is what lets take count an index with the resize bit set as one more element.
+            if (STEAL && lvRefElement(buffer, modifiedCalcCircularRefElementOffset(pIndex, mask)) != null) {
+                if (lvProducerIndex() == pIndex) {
+                    Thread.onSpinWait();      // that consumer is between its claim and its clear
+                }
+                continue;                     // else pIndex was stale: retry at once
+            }
 
             if (producerLimit <= pIndex) {
                 int result = offerSlowPath(mask, pIndex, producerLimit);
@@ -284,6 +317,58 @@ final class MpscUnboundedQueue<E> {
         consumerMask = (nextBuffer.length - 2L) << 1;
         soRefElement(buffer, nextArrayOffset, BUFFER_CONSUMED);
         return nextBuffer;
+    }
+
+    /**
+     * With stealing: takes the element at the consumer index, racing other consumers.
+     * Returns null only if the queue was empty at a read made during this call; waits
+     * for a producer whose index claim is done and whose store is not. owner: the caller
+     * is this queue's carrier.
+     */
+    @SuppressWarnings("unchecked")
+    E take(boolean owner) {
+        for (;;) {
+            long index = (long) CONSUMER_INDEX.getVolatile(this);
+            long pIndex = owner ? ownerProducerIndex : 0L;
+            if (index >= pIndex) {
+                pIndex = lvProducerIndex();
+                pIndex += (pIndex & RESIZE_BIT);
+                if (index >= pIndex) {
+                    return null;
+                }
+                if (owner) {
+                    ownerProducerIndex = pIndex;
+                }
+            }
+            E[] buffer = (E[]) CONSUMER_BUFFER.getAcquire(this);
+            long mask = (buffer.length - 2L) << 1;
+            int offset = modifiedCalcCircularRefElementOffset(index, mask);
+            Object e = lvRefElement(buffer, offset);
+            if (e == null || e == JUMP) {
+                // another consumer took index; this re-read also stops a consumer whose index is
+                // a lap stale from moving consumerBuffer on the next lap's JUMP, a lap early
+                if ((long) CONSUMER_INDEX.getVolatile(this) != index) {
+                    continue;
+                }
+                if (e == null) {
+                    if (owner) {
+                        ownerProducerIndex = index;    // read the producer index again: an offer can roll back
+                    }
+                    Thread.onSpinWait();               // its producer has claimed it and not stored it yet
+                } else {
+                    int link = nextArrayOffset(mask);
+                    Object next = lvRefElement(buffer, link);
+                    if (next != BUFFER_CONSUMED && CONSUMER_BUFFER.compareAndSet(this, buffer, (E[]) next)) {
+                        soRefElement(buffer, link, BUFFER_CONSUMED);
+                    }
+                }
+                continue;
+            }
+            if (CONSUMER_INDEX.compareAndSet(this, index, index + 2)) {
+                soRefElement(buffer, offset, null);    // the producer one lap on waits for this
+                return (E) e;
+            }
+        }
     }
 
     private E newBufferPoll(E[] nextBuffer, final long index) {
