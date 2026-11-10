@@ -288,17 +288,15 @@ final class MpscUnboundedQueue<E> {
         final long mask = consumerMask;
 
         final int offset = modifiedCalcCircularRefElementOffset(index, mask);
-        Object e = lvRefElement(buffer, offset);
-        if (e == null) {
+        Object e;
+        // re-read while waiting: a resize that runs out of memory rolls the producer index back
+        while ((e = lvRefElement(buffer, offset)) == null) {
             long pIndex = lvProducerIndex();
             pIndex += (pIndex & RESIZE_BIT);
             if (index == pIndex) {
                 return null;
             }
-            do {
-                Thread.onSpinWait();
-                e = lvRefElement(buffer, offset);
-            } while (e == null);
+            Thread.onSpinWait();
         }
         if (e == JUMP) {
             final E[] nextBuffer = nextBuffer(buffer, mask);
