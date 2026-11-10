@@ -24,8 +24,8 @@
 /*
  * @test id=mode4
  * @summary Thread.yield and Thread.sleep(0) on the MPSC scheduler, with the
- *          scheduler's assertions enabled: placed and unplaced yielders, mixed
- *          with parking, I/O readiness and pinned yields
+ *          scheduler's assertions enabled: yielders started together and apart,
+ *          mixed with parking, I/O readiness and pinned yields
  * @requires vm.continuations & os.family == "linux"
  * @modules java.base/java.lang:+open
  * @library /test/lib
@@ -59,20 +59,45 @@
  */
 
 /*
- * @test id=mode3-steal
+ * @test id=mode4-steal-one-carrier
  * @requires vm.continuations & os.family == "linux"
  * @modules java.base/java.lang:+open
  * @library /test/lib
  * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
  *                    -Djdk.virtualThreadScheduler.mpscSteal=true
- *                    -Djdk.pollerMode=3
+ *                    -Djdk.pollerMode=4
+ *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscYieldTest
+ */
+
+/*
+ * @test id=mode1
+ * @requires vm.continuations
+ * @modules java.base/java.lang:+open
+ * @library /test/lib
+ * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.pollerMode=1
+ *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
+ */
+
+/*
+ * @test id=mode1-steal
+ * @requires vm.continuations
+ * @modules java.base/java.lang:+open
+ * @library /test/lib
+ * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=true
+ *                    -Djdk.pollerMode=1
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
  */
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -83,11 +108,9 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import jdk.test.lib.thread.VThreadPinner;
-import jdk.test.lib.thread.VThreadScheduler;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -95,6 +118,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class MpscYieldTest {
     private static final int YIELDS = 2_000;
+    private static final boolean STEAL =
+            Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
 
     @BeforeAll
     static void assertionsEnabled() throws Exception {
@@ -115,29 +140,27 @@ class MpscYieldTest {
         }
     }
 
-    /**
-     * Returns a carrier of the scheduler, read from a virtual thread.
-     */
-    private static Thread aCarrier() throws InterruptedException {
-        AtomicReference<Thread> carrier = new AtomicReference<>();
-        Thread.ofVirtual().start(() -> carrier.set(VThreadScheduler.currentCarrierThread())).join();
-        return carrier.get();
+    private static Thread currentCarrierThread() {
+        try {
+            Method m = Thread.class.getDeclaredMethod("currentCarrierThread");
+            m.setAccessible(true);
+            return (Thread) m.invoke(null);
+        } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException(e);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     /**
-     * Returns an unstarted virtual thread placed on the given carrier, its preferred
-     * carrier.
+     * Starts the threads from one virtual thread: a thread started by a virtual
+     * thread starts on the starter's carrier, and without stealing stays there.
      */
-    private static Thread placed(Thread carrier, Runnable task) {
-        return VThreadScheduler.defaultScheduler()
-                .newThread(Thread.ofVirtual(), carrier, task)
-                .thread();
-    }
-
-    private static Thread startPlaced(Thread carrier, Runnable task) {
-        Thread t = placed(carrier, task);
-        t.start();
-        return t;
+    private static void startTogether(List<Thread> threads) throws InterruptedException {
+        Thread.ofVirtual().start(() -> threads.forEach(Thread::start)).join();
     }
 
     private static void joinAll(List<Thread> threads) throws InterruptedException {
@@ -147,35 +170,37 @@ class MpscYieldTest {
     }
 
     /**
-     * Placed yielders sharing one carrier complete, each yield returns, and all of
-     * them stay on that carrier.
+     * Yielders started together complete and each yield returns; without stealing
+     * they all run on the carrier they started on.
      */
     @Test
-    void testPlacedYielders() throws Exception {
-        Thread home = aCarrier();
+    void testYieldersStartedTogether() throws Exception {
         Set<Thread> carriers = ConcurrentHashMap.newKeySet();
         AtomicInteger yields = new AtomicInteger();
         var threads = new ArrayList<Thread>();
         for (int k = 0; k < 8; k++) {
-            threads.add(startPlaced(home, () -> {
+            threads.add(Thread.ofVirtual().unstarted(() -> {
                 for (int i = 0; i < YIELDS; i++) {
-                    carriers.add(VThreadScheduler.currentCarrierThread());
+                    carriers.add(currentCarrierThread());
                     yieldOnce(i);
                     yields.incrementAndGet();
                 }
             }));
         }
+        startTogether(threads);
         joinAll(threads);
         assertEquals(8 * YIELDS, yields.get());
-        assertEquals(Set.of(home), carriers);
+        if (!STEAL) {
+            assertEquals(1, carriers.size(), carriers.toString());
+        }
     }
 
     /**
-     * Unplaced yielders, more than there are carriers, complete; a lone unplaced
-     * yielder too.
+     * Yielders started from a platform thread, more than there are carriers,
+     * complete; a lone yielder too.
      */
     @Test
-    void testUnplacedYielders() throws Exception {
+    void testYieldersStartedApart() throws Exception {
         AtomicInteger yields = new AtomicInteger();
         var threads = new ArrayList<Thread>();
         for (int k = 0; k < 16; k++) {
@@ -198,12 +223,12 @@ class MpscYieldTest {
     }
 
     /**
-     * Placed and unplaced yielders that also park and unpark one another, so that
-     * yields, park races and wakeups from other carriers interleave.
+     * Yielders, half started together and half from a platform thread, that also
+     * park and unpark one another, so that yields, park races and wakeups from other
+     * carriers interleave.
      */
     @Test
     void testYieldAndPark() throws Exception {
-        Thread home = aCarrier();
         int n = 6;
         Thread[] ring = new Thread[n];
         AtomicInteger done = new AtomicInteger();
@@ -220,11 +245,17 @@ class MpscYieldTest {
                 }
                 done.incrementAndGet();
             };
-            ring[k] = (k % 2 == 0) ? placed(home, task) : Thread.ofVirtual().unstarted(task);
+            ring[k] = Thread.ofVirtual().unstarted(task);
         }
-        for (Thread t : ring) {
-            t.start();
+        var together = new ArrayList<Thread>();
+        for (int k = 0; k < n; k++) {
+            if (k % 2 == 0) {
+                together.add(ring[k]);
+            } else {
+                ring[k].start();
+            }
         }
+        startTogether(together);
         // a platform thread unparks them too, from outside every carrier
         Thread unparker = Thread.ofPlatform().start(() -> {
             while (!stop.get()) {
@@ -246,12 +277,12 @@ class MpscYieldTest {
     }
 
     /**
-     * A reader placed with yielders on one carrier receives every message written
-     * from a platform thread: I/O readiness and yields interleave on that carrier.
+     * A reader started together with yielders receives every message written from a
+     * platform thread: without stealing, or with one carrier, I/O readiness and
+     * yields interleave on one carrier.
      */
     @Test
     void testReaderBehindYielders() throws Exception {
-        Thread home = aCarrier();
         int messages = 200;
         try (ServerSocket listener = new ServerSocket()) {
             InetAddress lb = InetAddress.getLoopbackAddress();
@@ -262,14 +293,14 @@ class MpscYieldTest {
                 AtomicInteger received = new AtomicInteger();
                 var yielders = new ArrayList<Thread>();
                 for (int k = 0; k < 4; k++) {
-                    yielders.add(startPlaced(home, () -> {
+                    yielders.add(Thread.ofVirtual().unstarted(() -> {
                         int i = 0;
                         while (!stop.get()) {
                             yieldOnce(i++);
                         }
                     }));
                 }
-                Thread reader = startPlaced(home, () -> {
+                Thread reader = Thread.ofVirtual().unstarted(() -> {
                     try {
                         InputStream in = readerSide.getInputStream();
                         while (received.get() < messages) {
@@ -282,6 +313,9 @@ class MpscYieldTest {
                         throw new RuntimeException(e);
                     }
                 });
+                var together = new ArrayList<Thread>(yielders);
+                together.add(reader);
+                startTogether(together);
                 OutputStream out = writerSide.getOutputStream();
                 for (int i = 0; i < messages; i++) {
                     out.write(i);
@@ -303,22 +337,18 @@ class MpscYieldTest {
     @Test
     void testPinnedYield() throws Exception {
         Object lock = new Object();
-        Thread home = aCarrier();
-        for (boolean place : new boolean[] { false, true }) {
-            Runnable task = () -> {
-                for (int i = 0; i < 100; i++) {
-                    int n = i;
-                    Thread before = VThreadScheduler.currentCarrierThread();
-                    VThreadPinner.runPinned(() -> yieldOnce(n));
-                    assertSame(before, VThreadScheduler.currentCarrierThread());
-                    synchronized (lock) {
-                        yieldOnce(i);
-                    }
+        Thread t = Thread.ofVirtual().start(() -> {
+            for (int i = 0; i < 100; i++) {
+                int n = i;
+                Thread before = currentCarrierThread();
+                VThreadPinner.runPinned(() -> yieldOnce(n));
+                assertSame(before, currentCarrierThread());
+                synchronized (lock) {
                     yieldOnce(i);
                 }
-            };
-            Thread t = place ? startPlaced(home, task) : Thread.ofVirtual().start(task);
-            t.join();
-        }
+                yieldOnce(i);
+            }
+        });
+        t.join();
     }
 }
