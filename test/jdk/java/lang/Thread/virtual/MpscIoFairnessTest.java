@@ -216,25 +216,6 @@ class MpscIoFairnessTest {
         return false;
     }
 
-    /**
-     * Two threads that park and unpark each other until stop is set, so that the
-     * carrier they share always has one of them queued.
-     */
-    private static Thread[] wakeChain(AtomicBoolean stop) {
-        Thread[] chain = new Thread[2];
-        for (int k = 0; k < 2; k++) {
-            int other = 1 - k;
-            chain[k] = Thread.ofVirtual().unstarted(() -> {
-                while (!stop.get()) {
-                    LockSupport.unpark(chain[other]);
-                    LockSupport.park();
-                }
-                LockSupport.unpark(chain[other]);
-            });
-        }
-        return chain;
-    }
-
     private static Thread currentCarrierThread() {
         try {
             Method m = Thread.class.getDeclaredMethod("currentCarrierThread");
@@ -252,6 +233,57 @@ class MpscIoFairnessTest {
 
     private static void await(CountDownLatch latch, String what) throws InterruptedException {
         assertTrue(latch.await(LIMIT.toMillis(), TimeUnit.MILLISECONDS), what + " within " + LIMIT);
+    }
+
+    /**
+     * Wake chains, pairs of threads that park and unpark each other until stop is set,
+     * two pairs per carrier. Each pair is started by its own platform thread, which
+     * starts its virtual threads on one carrier, so consecutive starters cover every
+     * carrier. Returns once chain threads have run on every carrier. A carrier with a
+     * pair always has one of its threads queued, so it never runs dry, never steals,
+     * and polls its poller only when the poll interval expires.
+     */
+    private static List<Thread> wakeChains(AtomicBoolean stop) throws InterruptedException {
+        Set<Thread> seen = ConcurrentHashMap.newKeySet();
+        CountDownLatch everyCarrier = new CountDownLatch(1);
+        var threads = new ArrayList<Thread>();
+        for (int i = 0; i < 2 * PARALLELISM; i++) {
+            Thread[] chain = new Thread[2];
+            for (int k = 0; k < 2; k++) {
+                int other = 1 - k;
+                chain[k] = Thread.ofVirtual().unstarted(() -> {
+                    while (!stop.get()) {
+                        if (everyCarrier.getCount() > 0 && seen.add(currentCarrierThread())
+                                && seen.size() == PARALLELISM) {
+                            everyCarrier.countDown();
+                        }
+                        LockSupport.unpark(chain[other]);
+                        LockSupport.park();
+                    }
+                    LockSupport.unpark(chain[other]);
+                });
+            }
+            Thread.ofPlatform().start(() -> {
+                chain[0].start();
+                chain[1].start();
+            }).join();
+            threads.addAll(List.of(chain));
+        }
+        try {
+            await(everyCarrier, "wake chains on every carrier");
+        } catch (Throwable e) {
+            stopAll(stop, threads);
+            throw e;
+        }
+        return threads;
+    }
+
+    private static void stopAll(AtomicBoolean stop, List<Thread> threads)
+            throws InterruptedException {
+        stop.set(true);
+        for (Thread t : threads) {
+            t.join();
+        }
     }
 
     private static void rethrow(AtomicReference<Throwable> failure) {
@@ -298,7 +330,7 @@ class MpscIoFairnessTest {
     }
 
     /**
-     * A reader on the carrier of an endless wake chain receives every message.
+     * A reader receives every message while every carrier runs an endless wake chain.
      */
     @Test
     void testWakeChainDoesNotStarveReader() throws Exception {
@@ -307,42 +339,44 @@ class MpscIoFairnessTest {
             AtomicBoolean stop = new AtomicBoolean();
             AtomicInteger received = new AtomicInteger();
             AtomicReference<Throwable> failure = new AtomicReference<>();
-            Thread reader = Thread.ofVirtual().unstarted(() -> {
-                try {
-                    InputStream in = pair.in();
-                    while (received.get() < messages && in.read() >= 0) {
-                        received.incrementAndGet();
+            List<Thread> chains = wakeChains(stop);
+            Thread reader = null;
+            boolean served;
+            int receivedInLimit;
+            try {
+                reader = Thread.ofVirtual().start(() -> {
+                    try {
+                        InputStream in = pair.in();
+                        while (received.get() < messages && in.read() >= 0) {
+                            received.incrementAndGet();
+                        }
+                    } catch (Throwable e) {
+                        failure.set(e);
                     }
-                } catch (Throwable e) {
-                    failure.set(e);
+                });
+                awaitReadPark(reader);
+                OutputStream out = pair.out();
+                for (int i = 0; i < messages; i++) {
+                    out.write(i);
+                    out.flush();
+                    Thread.sleep(1);
                 }
-            });
-            Thread[] chain = wakeChain(stop);
-            startTogether(List.of(reader, chain[0], chain[1]));
-            awaitReadPark(reader);
-            OutputStream out = pair.out();
-            for (int i = 0; i < messages; i++) {
-                out.write(i);
-                out.flush();
-                Thread.sleep(1);
-            }
-            boolean served = reader.join(LIMIT);
-            int receivedInLimit = received.get();
-            stop.set(true);
-            for (Thread t : chain) {
-                t.join();
+                served = reader.join(LIMIT);
+                receivedInLimit = received.get();
+            } finally {
+                stopAll(stop, chains);
             }
             reader.join();
             rethrow(failure);
             assertTrue(served, "reader received " + receivedInLimit + " of " + messages
-                    + " within " + LIMIT + " behind a wake chain");
+                    + " within " + LIMIT + " behind wake chains");
             assertEquals(messages, received.get());
         }
     }
 
     /**
-     * On the carrier of an endless wake chain, a read with a timeout whose data is
-     * written once the reader blocks returns the data well before the timeout: by
+     * While every carrier runs an endless wake chain, a read with a timeout whose data
+     * is written once the reader blocks returns the data well before the timeout: by
      * readiness, not by the timeout's wakeup.
      */
     @Test
@@ -354,27 +388,29 @@ class MpscIoFairnessTest {
             AtomicInteger received = new AtomicInteger(-1);
             AtomicLong returnedAt = new AtomicLong();
             AtomicReference<Throwable> failure = new AtomicReference<>();
-            Thread reader = Thread.ofVirtual().unstarted(() -> {
-                try {
-                    received.set(pair.in().read());
-                    returnedAt.set(System.nanoTime());
-                } catch (Throwable e) {
-                    failure.set(e);
-                }
-            });
-            Thread[] chain = wakeChain(stop);
-            startTogether(List.of(reader, chain[0], chain[1]));
-            awaitReadPark(reader);
-            long writtenAt = System.nanoTime();
-            pair.out().write(42);
-            boolean served = reader.join(LIMIT);
-            stop.set(true);
-            for (Thread t : chain) {
-                t.join();
+            List<Thread> chains = wakeChains(stop);
+            Thread reader = null;
+            boolean served;
+            long writtenAt;
+            try {
+                reader = Thread.ofVirtual().start(() -> {
+                    try {
+                        received.set(pair.in().read());
+                        returnedAt.set(System.nanoTime());
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    }
+                });
+                awaitReadPark(reader);
+                writtenAt = System.nanoTime();
+                pair.out().write(42);
+                served = reader.join(LIMIT);
+            } finally {
+                stopAll(stop, chains);
             }
             reader.join();
             rethrow(failure);
-            assertTrue(served, "read did not return within " + LIMIT + " behind a wake chain");
+            assertTrue(served, "read did not return within " + LIMIT + " behind wake chains");
             assertEquals(42, received.get());
             long waitedMillis = TimeUnit.NANOSECONDS.toMillis(returnedAt.get() - writtenAt);
             assertTrue(waitedMillis < timeoutMillis / 2,
