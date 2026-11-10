@@ -34,23 +34,31 @@ import sun.nio.ch.LocalPollers;
 /**
  * A virtual thread scheduler with one MPSC queue per carrier (MpscCarrierThread).
  *
- * <p>Each virtual thread has a home, the carrier that every continuation of the
- * thread is submitted to. It is set on start: the starting carrier or, from a
- * platform thread, the carrier that thread's stable probe picks. A preferred carrier is
- * ignored. Without stealing the home never changes; with {@link #STEAL} a thief
- * becomes the home of the thread it steals.
+ * <p>Each virtual thread has a home, the carrier it last ran on, and every
+ * continuation of the thread is submitted to it. The home is set on start: the
+ * starting carrier or, from a platform thread, the carrier that thread's stable probe
+ * picks. A preferred carrier is ignored. Without stealing the home never changes and
+ * every wake goes to it. With {@link #STEAL} it moves in two ways: a thief becomes the
+ * home of the thread it steals, before it runs it; and a wake made on a carrier of
+ * this scheduler makes that carrier the home before queueing the thread there. A wake
+ * is made on a carrier by a virtual thread mounted on it (unpark, interrupt, a
+ * pollerMode 2 read sub-poller) or by the carrier's own thread (readiness from its
+ * poll, a park race's resubmit, a yield, a join wake). A wake from any other thread
+ * (timers, the monitor unblocker, platform-thread pollers, an external unpark) goes
+ * to the home.
  *
  * <p>Mode 4 (CARRIER_LOCAL_POLLER) is the default where available (Linux, with
  * continuations, jdk.pollerMode unset or 4): each carrier owns a LocalPoller that VT
- * fds register with directly, and alternates rounds of its queue with polls.
+ * fds register with directly, and polls it only when its queue is empty, at a task
+ * boundary once a time bound has passed since its last poll, before it queues a
+ * lone yielder, and blocking when it parks (see MpscCarrierThread).
  * Mode 3 is not supported: jdk.pollerMode=3 falls back, with a warning, to the
  * platform's default poller mode.
  *
- * <p>A yield resubmits the thread. Without stealing, in Mode 4, its carrier holds it
- * and runs it at the end of the next round, after everything queued before it,
- * including what the poll woke. Otherwise it goes to the tail of its home queue; with
- * stealing it is never held, as a held thread is not in the queue thieves take from.
- * A lone yielder never makes its carrier block.
+ * <p>A yield resubmits the thread to the tail of the queue of the carrier it yielded
+ * on, its home. In Mode 4, when that queue is empty, the carrier first polls, so a
+ * lone yielder gives way to ready I/O on every yield. A lone yielder never makes its
+ * carrier block.
  *
  * <p>With stealing, a producer wakes the home carrier if it is parked, else signals
  * (SearchGate); the owner announces its own submissions before its next task if they

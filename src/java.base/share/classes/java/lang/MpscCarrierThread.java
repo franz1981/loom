@@ -40,6 +40,14 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * A carrier thread of MpscVirtualThreadScheduler; localPoller() implements
  * LocalPoller.Carrier for sun.nio.ch.Poller. Mode 4 when poller is not null.
  *
+ * <p>The carrier runs its queue as one live FIFO. In Mode 4 it polls its poller, with
+ * no thread mounted, only: without blocking when its queue is empty; without blocking
+ * at a task boundary once {@code jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros}
+ * (default 500) has passed since its last poll, if tasks are queued and fds are
+ * registered; without blocking before it queues a yielder that would be alone in its
+ * queue; and blocking, on the park path. Readiness unparks threads on this carrier's
+ * own thread, so they are queued here.
+ *
  * <p>States of {@code carrierState}:
  * <pre>
  *   RUNNING -> PARKED                 the carrier
@@ -54,6 +62,12 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>A task offered to a parked carrier is never missed, and a park costs at most
  *     one wake.
  * <li>No task runs while the state reads PARKED.
+ * <li>The queue is one live FIFO: a task runs after everything queued on this
+ *     carrier before it, unless a thief takes it first. A runnable thread is in
+ *     exactly one carrier's queue or is a task in hand; none is held aside.
+ * <li>Mode 4: a fd ready on this carrier's poller is polled within the poll interval
+ *     plus the task in progress, or sooner when the queue empties; a poll that fills
+ *     its event array leaves the interval expired.
  * <li>With stealing, a task is announced unless it is the next task its owner runs:
  *     by its producer when that is another thread (or by the owner after WAKING, for
  *     it), else by the owner before it runs the next task.
@@ -62,8 +76,6 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>With stealing, the owner's own thread offers tasks only with no thread mounted
  *     (after a continuation unmounts, or from its polls), never from a task's code;
  *     run(task) is the only place a task runs.
- * <li>Held yields exist only without stealing, in Mode 4, and there are none
- *     whenever the state reads PARKED.
  * </ul>
  */
 final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
