@@ -117,9 +117,6 @@ final class MpscVirtualThreadScheduler
         // thread; a submitter reads it after the thread's state change that follows that run
         private MpscCarrierThread home;
 
-        // link in the held yields of the carrier the thread yielded on (holdYield)
-        MpscTask nextYielded;
-
         MpscTask(VirtualThread vthread) {
             super(vthread);
         }
@@ -161,11 +158,13 @@ final class MpscVirtualThreadScheduler
             onStart(task);
             return;
         }
-        // holdYield relies on this
-        assert !(task instanceof MpscTask t && t.isYielded())
-                || Thread.currentThread() == home
+        boolean yielded = task instanceof VirtualThread.VThreadTask t && t.isYielded();
+        // the carrier a thread yielded on resubmits it, and that carrier is its home
+        assert !(yielded && task instanceof MpscTask) || Thread.currentThread() == home
                 : "YIELDED thread submitted by " + Thread.currentThread();
-        if (!home.holdYield(task)) {
+        if (yielded) {
+            home.resubmitYield(task);
+        } else {
             home.submit(task);
         }
     }

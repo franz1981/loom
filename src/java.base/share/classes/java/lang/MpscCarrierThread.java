@@ -25,10 +25,10 @@
 package java.lang;
 
 import java.io.IOException;
-import java.lang.MpscVirtualThreadScheduler.MpscTask;
 import java.lang.Thread.VirtualThreadTask;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import jdk.internal.vm.annotation.Contended;
 import sun.nio.ch.LocalPoller;
@@ -79,6 +79,13 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         }
     }
 
+    /**
+     * Mode 4: how long a carrier whose queue does not empty runs tasks before it
+     * polls its poller, checked at task boundaries.
+     */
+    private static final long MAX_POLL_INTERVAL_NANOS = TimeUnit.MICROSECONDS.toNanos(Math.max(0L,
+            Long.getLong("jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros", 500L)));
+
     final int id;
     private final MpscUnboundedQueue<VirtualThreadTask> queue = new MpscUnboundedQueue<>(64);
     private final MpscVirtualThreadScheduler scheduler;
@@ -87,8 +94,9 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     private final LocalPoller poller;
 
+    // System.nanoTime() of the last poll that reached the poller
     @Contended("local")
-    private MpscTask yieldedHead, yieldedTail;
+    private long lastPoll;
 
     @Contended("state")
     private volatile int carrierState;
@@ -112,6 +120,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         this.gate = gate;
         this.poller = poller;
         this.xorshift = (id + 1) * 0x9E3779B9 | 1;
+        this.lastPoll = System.nanoTime();
         setDaemon(true);
     }
 
@@ -230,24 +239,16 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     /**
-     * Without stealing, in Mode 4: holds a yield's resubmit, which only this carrier with
-     * no thread mounted makes, until the next round (drainRound); false if the caller
-     * must queue it. Always false with stealing: a held thread is not in the queue
-     * thieves take from, and the stealing loops run no held yields.
+     * Submits a yielded thread. In Mode 4, on this carrier, a yielder that would be
+     * alone in the queue is queued behind the I/O that is ready now.
      */
-    boolean holdYield(VirtualThreadTask task) {
-        if (STEAL || Thread.currentThread() != this || poller == null
-                || !(task instanceof MpscTask t) || !t.isYielded()) {
-            return false;
+    void resubmitYield(VirtualThreadTask task) {
+        if (poller != null && Thread.currentThread() == this && !hasQueued()) {
+            // inside the yielder's afterYield: it is not queued yet, so no thief can
+            // run it while this carrier polls
+            admit();
         }
-        MpscTask tail = yieldedTail;
-        if (tail == null) {
-            yieldedHead = t;
-        } else {
-            tail.nextYielded = t;
-        }
-        yieldedTail = t;
-        return true;
+        submit(task);
     }
 
     int nextRandom() {
@@ -281,27 +282,26 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     private void eventLoop() {
+        var queue = this.queue;
         var poller = this.poller;
         for (;;) {
-            int drained = drainRound();
-
-            int ioEvents = 0;
-            try {
-                ioEvents = poller.poll(0);
-            } catch (IOException e) { }
-
-            if (drained + ioEvents > 0) {
-                continue;
+            if (pollDue()) {
+                admit();
             }
-
-            try {
-                if (poller.poll(0) > 0) continue;
-            } catch (IOException e) { }
-
-            carrierState = PARKED;
 
             VirtualThreadTask task = queue.poll();
             if (task != null) {
+                try { task.run(); } catch (Throwable t) { }
+                continue;
+            }
+
+            if (admit() > 0) {
+                continue;
+            }
+
+            carrierState = PARKED;
+
+            if ((task = queue.poll()) != null) {
                 carrierState = RUNNING;
                 try { task.run(); } catch (Throwable t) { }
                 continue;
@@ -310,47 +310,39 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
             try {
                 poller.poll(-1);
             } catch (IOException e) { }
+            polled();
             carrierState = RUNNING;
         }
     }
 
+    /** Mode 4, at a task boundary: tasks are queued and the poll interval has passed. */
+    private boolean pollDue() {
+        return hasQueued() && poller.hasRegistrations()
+                && System.nanoTime() - lastPoll >= MAX_POLL_INTERVAL_NANOS;
+    }
+
     /**
-     * Runs the tasks the queue held when the round began, then the held yields.
-     * Arrivals wait for the next round, so the poll between rounds is always reached;
-     * the bound is a count, not a time, so the gap between polls grows with the backlog.
+     * Mode 4, on this carrier with no thread mounted: polls without blocking and
+     * returns the number of threads unparked. Readiness wakes this carrier's own
+     * thread, so the unparked threads are queued here.
      */
-    private int drainRound() {
-        var queue = this.queue;
-        int quota = queue.size();
-        MpscTask yielded = takeYielded();
-        int ran = 0;
-        VirtualThreadTask task;
-        while (ran < quota && (task = queue.poll()) != null) {
-            try { task.run(); } catch (Throwable t) { }
-            ran++;
+    private int admit() {
+        // only this carrier registers, so no registration can appear during the poll
+        if (!poller.hasRegistrations()) {
+            return 0;
         }
-        return ran + runYielded(yielded);
+        int unparked = 0;
+        try {
+            unparked = poller.poll(0);
+        } catch (IOException e) { }
+        polled();
+        return unparked;
     }
 
-    private MpscTask takeYielded() {
-        MpscTask head = yieldedHead;
-        if (head != null) {
-            yieldedHead = yieldedTail = null;
-        }
-        return head;
-    }
-
-    private static int runYielded(MpscTask task) {
-        int ran = 0;
-        while (task != null) {
-            MpscTask next = task.nextYielded;
-            // before the run: a yield in it links the task into the next round's list
-            task.nextYielded = null;
-            try { task.run(); } catch (Throwable t) { }
-            ran++;
-            task = next;
-        }
-        return ran;
+    private void polled() {
+        long now = System.nanoTime();
+        // a full event array may have left readiness behind: the next boundary polls again
+        lastPoll = poller.lastPollFilled() ? now - MAX_POLL_INTERVAL_NANOS : now;
     }
 
     private void plainLoop() {
