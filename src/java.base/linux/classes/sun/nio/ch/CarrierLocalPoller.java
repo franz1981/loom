@@ -53,6 +53,9 @@ final class CarrierLocalPoller implements LocalPoller {
     private final EventFD eventfd;
     private final FdMap fdToThread = new FdMap();
 
+    // owner only
+    private boolean lastPollFilled;
+
     CarrierLocalPoller() throws IOException {
         int epfd = EPoll.create();
         long address = 0L;
@@ -113,9 +116,11 @@ final class CarrierLocalPoller implements LocalPoller {
     @Override
     public int poll(int timeout) throws IOException {
         if (timeout == 0 && fdToThread.isEmpty()) {
+            lastPollFilled = false;
             return 0;
         }
         int n = EPoll.wait(epfd, pollAddress, MAX_EVENTS, timeout);
+        lastPollFilled = (n == MAX_EVENTS);
         int unparked = 0;
         for (int i = 0; i < n; i++) {
             long eventAddress = EPoll.getEvent(pollAddress, i);
@@ -131,6 +136,16 @@ final class CarrierLocalPoller implements LocalPoller {
             }
         }
         return unparked;
+    }
+
+    @Override
+    public boolean hasRegistrations() {
+        return !fdToThread.isEmpty();
+    }
+
+    @Override
+    public boolean lastPollFilled() {
+        return lastPollFilled;
     }
 
     /**

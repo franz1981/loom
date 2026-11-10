@@ -62,6 +62,19 @@ public interface LocalPoller {
     int poll(int timeout) throws IOException;
 
     /**
+     * Whether a file descriptor is registered and not yet polled ready or
+     * deregistered. Only the owning carrier registers, so on the owning carrier a
+     * false result stays false until it registers again.
+     */
+    boolean hasRegistrations();
+
+    /**
+     * Whether the last {@link #poll} returned as many events as one poll can, so
+     * more may be ready. Called by the owning carrier only.
+     */
+    boolean lastPollFilled();
+
+    /**
      * Wakes the owning carrier from a blocking {@link #poll}. Called by any thread.
      */
     void wakeup() throws IOException;
