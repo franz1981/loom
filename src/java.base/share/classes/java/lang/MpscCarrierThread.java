@@ -57,7 +57,7 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>With stealing, a stealable task is announced unless it is the next task its
  *     owner runs: by its producer when that is another thread (or by the owner after
  *     WAKING, for it), else by the owner before it runs the next task.
- * <li>stealQueue is single-consumer: the owner and thieves take turns.
+ * <li>With stealing, the owner and thieves consume the queue in turns (stealLock).
  * <li>With stealing, the owner's own thread offers stealable tasks only with no thread
  *     mounted (after a continuation unmounts, or from its polls), never from a task's
  *     code; run(task) is the only place a task runs.
@@ -81,9 +81,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private final MpscVirtualThreadScheduler scheduler;
     private final IdleSet idleSet;
     private final SearchGate gate;
-
-    private final MpscUnboundedQueue<VirtualThreadTask> stealQueue =
-            STEAL ? new MpscUnboundedQueue<>(64) : null;
 
     private final LocalPoller poller;
 
@@ -206,7 +203,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     private void offerStealable(VirtualThreadTask task) {
-        stealQueue.offer(task);
+        queue.offer(task);
         if (Thread.currentThread() == this) {
             unannounced = true;
             return;
@@ -422,33 +419,12 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     private int drainRoundSteal() {
-        var queue = this.queue;
         int quota = queue.size();
-        int stealQuota = stealQueue.size();
-        MpscTask yielded = takeYielded();
         int ran = 0;
         VirtualThreadTask task;
-        for (int i = 0; i < quota && (task = queue.poll()) != null; i++) {
+        for (int i = 0; i < quota && (task = pollStealable()) != null; i++) {
             run(task);
             ran++;
-        }
-        for (int i = 0; i < stealQuota && (task = pollStealable()) != null; i++) {
-            run(task);
-            ran++;
-        }
-        return ran + runYieldedSteal(yielded);
-    }
-
-    /** As runYielded, through run(task). */
-    private int runYieldedSteal(MpscTask task) {
-        int ran = 0;
-        while (task != null) {
-            MpscTask next = task.nextYielded;
-            // before the run: a yield in it links the task into the next round's list
-            task.nextYielded = null;
-            run(task);
-            ran++;
-            task = next;
         }
         return ran;
     }
@@ -456,8 +432,8 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     /**
      * With stealing, the only place a task runs: a run site that bypasses it leaves the
      * owner's own offers unannounced. Those offers are announced here if anything
-     * stealable is still queued behind this task; a lone stealable task finds stealQueue
-     * empty after its own take and stays with its owner.
+     * is still queued behind this task; a lone task finds the queue empty after its
+     * own take and stays with its owner.
      */
     private void run(VirtualThreadTask task) {
         if (unannounced) {
@@ -469,12 +445,9 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         try { task.run(); } catch (Throwable t) { }
     }
 
-    /** Still PARKED: rechecks its own queues, then tries one steal; false to block. */
+    /** Still PARKED: rechecks its own queue, then tries one steal; false to block. */
     private boolean workBeforeBlocking() {
-        VirtualThreadTask task = queue.poll();
-        if (task == null) {
-            task = pollStealable();
-        }
+        VirtualThreadTask task = pollStealable();
         if (task != null) {
             abortPark();
             run(task);
@@ -493,10 +466,10 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         return false;
     }
 
-    /** Keeps one task of the backlog for itself unless other work runs first. */
+    /** Keeps one task of the backlog for itself unless it has a task in hand. */
     private void announceBacklog(boolean taskInHand) {
         int backlog = stealableBacklog();
-        if (backlog > 1 || (backlog == 1 && (taskInHand || !queue.isEmpty()))) {
+        if (backlog > 1 || (backlog == 1 && taskInHand)) {
             gate.signal(this);
         }
     }
@@ -521,23 +494,23 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         while (!STEAL_LOCK.compareAndSet(this, 0, 1)) {
             Thread.onSpinWait();
         }
-        VirtualThreadTask task = stealQueue.poll();
+        VirtualThreadTask task = queue.poll();
         STEAL_LOCK.setRelease(this, 0);
         return task;
     }
 
-    // ---- The stealable queue as other carriers and SearchGate see it ----
+    // ---- The queue as other carriers and SearchGate see it ----
 
     int stealableBacklog() {
-        return stealQueue.sizeEstimate();
+        return queue.sizeEstimate();
     }
 
     boolean hasStealable() {
-        return !stealQueue.isEmpty();
+        return !queue.isEmpty();
     }
 
     private VirtualThreadTask trySteal() {
-        var q = stealQueue;
+        var q = queue;
         if (q.isEmpty()) {
             return null;
         }
