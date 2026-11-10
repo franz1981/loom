@@ -35,21 +35,20 @@ import sun.nio.ch.LocalPollers;
  * A virtual thread scheduler with one MPSC queue per carrier (MpscCarrierThread).
  *
  * <p>Each virtual thread has a home, a carrier and one of its queues, set on start
- * and used by every continuation. A placed thread (a preferred carrier of this
- * scheduler) stays on its carrier's pinned queue for life. An unplaced thread
- * starts on the starting carrier or, from a platform thread, on the carrier that
- * thread's stable probe picks.
+ * and used by every continuation. A thread starts on the starting carrier or, from
+ * a platform thread, on the carrier that thread's stable probe picks. A preferred
+ * carrier is ignored.
  *
  * <p>Mode 4 (CARRIER_LOCAL_POLLER) is the default where available (Linux, with
  * continuations, jdk.pollerMode unset or 4): each carrier owns a LocalPoller that VT
  * fds register with directly, and alternates rounds of its queues with polls.
  *
- * <p>A yield resubmits the thread. In Mode 4 a thread with a pinned home is held by
+ * <p>A yield resubmits the thread. Without stealing, in Mode 4 a thread is held by
  * its carrier and runs at the end of the next round, after everything queued before
  * it, including what the poll woke; any other goes to the tail of its home queue. A
  * lone yielder never makes its carrier block.
  *
- * <p>With {@link #STEAL}, every unplaced thread's home is its carrier's stealable
+ * <p>With {@link #STEAL}, every thread's home is its carrier's stealable
  * queue, and then the last carrier that took it. A producer of a stealable task wakes
  * the owner if it is parked, else signals (SearchGate); the owner announces its own
  * submissions before its next task if they are not that task, and a WAKING owner
@@ -132,35 +131,23 @@ final class MpscVirtualThreadScheduler
     }
 
     static final class MpscTask extends VirtualThread.VThreadTask {
-        // a carrier index, taken mod the carrier count, or -1 if unplaced
-        final int placement;
-
         // written before each offer, which publishes it to the next submitter
         private Home home;
 
         // link in the held yields of the carrier the thread yielded on (holdYield)
         MpscTask nextYielded;
 
-        MpscTask(VirtualThread vthread, int placement) {
+        MpscTask(VirtualThread vthread) {
             super(vthread);
-            this.placement = placement;
         }
     }
 
     @Override
-    public VirtualThread.VThreadTask newTask(VirtualThread vthread, Thread preferredCarrier) {
-        int placement = (preferredCarrier instanceof MpscCarrierThread ct && ct.belongsTo(this)) ? ct.id : -1;
-        return new MpscTask(vthread, placement);
+    public VirtualThread.VThreadTask newTask(VirtualThread vthread) {
+        return new MpscTask(vthread);
     }
 
     // A custom scheduler's task keeps its home in builtinState.
-
-    private int placement(VirtualThreadTask task) {
-        if (task instanceof MpscTask t) {
-            return t.placement;
-        }
-        return (task.preferredCarrier() instanceof MpscCarrierThread ct && ct.belongsTo(this)) ? ct.id : -1;
-    }
 
     private static Home home(VirtualThreadTask task) {
         if (task instanceof MpscTask t) {
@@ -179,14 +166,7 @@ final class MpscVirtualThreadScheduler
 
     @Override
     public void onStart(VirtualThreadTask task) {
-        int placement = placement(task);
-        Home home;
-        if (placement >= 0) {
-            home = carriers[Math.floorMod(placement, carriers.length)].pinnedHome();
-        } else {
-            MpscCarrierThread target = carrierFor();
-            home = target.unplacedHome();
-        }
+        Home home = carrierFor().unplacedHome();
         setHome(task, home);
         home.submit(task);
     }

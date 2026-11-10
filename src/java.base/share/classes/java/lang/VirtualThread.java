@@ -267,7 +267,7 @@ final class VirtualThread extends BaseVirtualThread {
         this.cont = new VThreadContinuation(this, task);
 
         if (scheduler == BUILTIN_SCHEDULER) {
-            this.runContinuation = BUILTIN_SCHEDULER.newTask(this, preferredCarrier);
+            this.runContinuation = BUILTIN_SCHEDULER.newTask(this);
         } else {
             this.runContinuation = new CustomVThreadTask(this, preferredCarrier);
         }
@@ -1531,9 +1531,8 @@ final class VirtualThread extends BaseVirtualThread {
     interface BuiltinScheduler extends VirtualThreadScheduler {
         /**
          * Creates the task of a new virtual thread scheduled by this scheduler.
-         * @param preferredCarrier the preferred carrier or null
          */
-        default VThreadTask newTask(VirtualThread vthread, Thread preferredCarrier) {
+        default VThreadTask newTask(VirtualThread vthread) {
             return new VThreadTask(vthread);
         }
     }

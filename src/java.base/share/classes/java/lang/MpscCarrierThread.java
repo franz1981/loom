@@ -216,10 +216,6 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         }
     }
 
-    Home pinnedHome() {
-        return pinnedHome;
-    }
-
     Home unplacedHome() {
         return STEAL ? stealableHome : pinnedHome;
     }
