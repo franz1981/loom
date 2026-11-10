@@ -229,11 +229,13 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     }
 
     /**
-     * Mode 4: holds a yield's resubmit, which only this carrier with no thread mounted
-     * makes, until the next round (drainRound); false if the caller must queue it.
+     * Without stealing, in Mode 4: holds a yield's resubmit, which only this carrier with
+     * no thread mounted makes, until the next round (drainRound); false if the caller
+     * must queue it. Always false with stealing: a held thread is not in the queue
+     * thieves take from, and the stealing loops run no held yields.
      */
     boolean holdYield(VirtualThreadTask task) {
-        if (Thread.currentThread() != this || poller == null
+        if (STEAL || Thread.currentThread() != this || poller == null
                 || !(task instanceof MpscTask t) || !t.isYielded()) {
             return false;
         }

@@ -161,7 +161,7 @@ final class MpscVirtualThreadScheduler
         assert !(task instanceof MpscTask t && t.isYielded())
                 || Thread.currentThread() == home
                 : "YIELDED thread submitted by " + Thread.currentThread();
-        if (STEAL || !home.holdYield(task)) {
+        if (!home.holdYield(task)) {
             home.submit(task);
         }
     }
