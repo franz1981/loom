@@ -169,6 +169,10 @@ final class MpscVirtualThreadScheduler
             onStart(task);
             return;
         }
+        boolean yielded = task instanceof VirtualThread.VThreadTask t && t.isYielded();
+        // the carrier a thread yielded on resubmits it, and that carrier is its home
+        assert !(yielded && task instanceof MpscTask) || Thread.currentThread() == home
+                : "YIELDED thread submitted by " + Thread.currentThread();
         // without stealing nothing would move the thread off a carrier whose waker
         // never unmounts, so only with stealing does a wake made on a carrier move it
         if (STEAL && Thread.currentCarrierThread() instanceof MpscCarrierThread ct
@@ -176,10 +180,6 @@ final class MpscVirtualThreadScheduler
             setHome(task, ct);
             home = ct;
         }
-        boolean yielded = task instanceof VirtualThread.VThreadTask t && t.isYielded();
-        // the carrier a thread yielded on resubmits it, and that carrier is its home
-        assert !(yielded && task instanceof MpscTask) || Thread.currentThread() == home
-                : "YIELDED thread submitted by " + Thread.currentThread();
         if (yielded) {
             home.resubmitYield(task);
         } else {
