@@ -31,6 +31,7 @@
  * @modules java.base/java.lang:+open
  * @run junit/othervm -esa
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=4
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscIoFairnessTest
  */
@@ -52,6 +53,7 @@
  * @modules java.base/java.lang:+open
  * @run junit/othervm -esa
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=4
  *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscIoFairnessTest
  */
@@ -73,6 +75,7 @@
  * @modules java.base/java.lang:+open
  * @run junit/othervm -esa
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=2
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscIoFairnessTest
  */
@@ -94,6 +97,7 @@
  * @modules java.base/java.lang:+open
  * @run junit/othervm -esa
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=1
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscIoFairnessTest
  */
@@ -138,7 +142,8 @@ class MpscIoFairnessTest {
     // a hang fails by this limit, well inside the jtreg timeout
     private static final Duration LIMIT = Duration.ofSeconds(10);
     private static final boolean STEAL =
-            Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
+            Boolean.parseBoolean(
+                    System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
     private static final int PARALLELISM =
             Integer.getInteger("jdk.virtualThreadScheduler.parallelism");
 

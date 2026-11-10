@@ -31,6 +31,7 @@
  * @library /test/lib
  * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=4
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
  */
@@ -54,6 +55,7 @@
  * @library /test/lib
  * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=4
  *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscYieldTest
  */
@@ -77,6 +79,7 @@
  * @library /test/lib
  * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=2
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
  */
@@ -100,6 +103,7 @@
  * @library /test/lib
  * @run junit/othervm/native -esa --enable-native-access=ALL-UNNAMED
  *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
  *                    -Djdk.pollerMode=1
  *                    -Djdk.virtualThreadScheduler.parallelism=4 MpscYieldTest
  */
@@ -143,7 +147,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class MpscYieldTest {
     private static final int YIELDS = 2_000;
     private static final boolean STEAL =
-            Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
+            Boolean.parseBoolean(
+                    System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
 
     @BeforeAll
     static void assertionsEnabled() throws Exception {

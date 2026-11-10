@@ -69,10 +69,12 @@ final class MpscVirtualThreadScheduler
         implements VirtualThread.BuiltinScheduler, LocalPoller.Scheduler {
 
     /**
-     * Opt-in work stealing; when off, there is no SearchGate or IdleSet and the carriers
-     * run loops that never steal.
+     * Work stealing, on unless jdk.virtualThreadScheduler.mpscSteal is false. Off is a
+     * diagnostic setting: there is no SearchGate or IdleSet and the carriers run loops
+     * that never steal.
      */
-    static final boolean STEAL = Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
+    static final boolean STEAL = Boolean.parseBoolean(
+            System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
 
     private final MpscCarrierThread[] carriers;
 
