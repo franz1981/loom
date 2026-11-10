@@ -306,7 +306,7 @@ final class MpscUnboundedQueue<E> {
 
     /**
      * An estimate of the number of queued elements, >= 0: one load of each index in
-     * isEmpty()'s order, no retry (size() retries while the consumer index moves).
+     * isEmpty()'s order, no retry while the consumer index moves.
      * It is 0 exactly when isEmpty() would be true at the same two reads.
      */
     int sizeEstimate() {
@@ -315,25 +315,5 @@ final class MpscUnboundedQueue<E> {
         pIndex += (pIndex & RESIZE_BIT);
         long size = (pIndex - cIndex) >> 1;
         return size <= 0 ? 0 : (int) Math.min(size, Integer.MAX_VALUE);
-    }
-
-    int size() {
-        long after = lvConsumerIndex();
-        long size;
-        while (true) {
-            final long before = after;
-            final long currentProducerIndex = lvProducerIndex();
-            after = lvConsumerIndex();
-            if (before == after) {
-                long pIndex = currentProducerIndex;
-                pIndex += (pIndex & RESIZE_BIT);
-                size = (pIndex - after) >> 1;
-                break;
-            }
-        }
-        if (size > Integer.MAX_VALUE) {
-            return Integer.MAX_VALUE;
-        }
-        return (int) size;
     }
 }
