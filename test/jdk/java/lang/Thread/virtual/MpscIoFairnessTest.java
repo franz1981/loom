@@ -25,7 +25,8 @@
  * @test id=mode4
  * @summary On the MPSC scheduler, I/O readiness reaches a reader on a carrier
  *          whose queue never empties: behind a lone yielder and behind an
- *          endless wake chain
+ *          endless wake chain. Where a woken thread is queued: with stealing, on
+ *          the carrier the wake was made on, else on its home
  * @requires vm.continuations & os.family == "linux"
  * @modules java.base/java.lang:+open
  * @run junit/othervm -esa
@@ -110,12 +111,18 @@
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -130,6 +137,10 @@ import static org.junit.jupiter.api.Assertions.*;
 class MpscIoFairnessTest {
     // a hang fails by this limit, well inside the jtreg timeout
     private static final Duration LIMIT = Duration.ofSeconds(10);
+    private static final boolean STEAL =
+            Boolean.getBoolean("jdk.virtualThreadScheduler.mpscSteal");
+    private static final int PARALLELISM =
+            Integer.getInteger("jdk.virtualThreadScheduler.parallelism");
 
     @BeforeAll
     static void assertionsEnabled() throws Exception {
@@ -194,6 +205,25 @@ class MpscIoFairnessTest {
             });
         }
         return chain;
+    }
+
+    private static Thread currentCarrierThread() {
+        try {
+            Method m = Thread.class.getDeclaredMethod("currentCarrierThread");
+            m.setAccessible(true);
+            return (Thread) m.invoke(null);
+        } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException(e);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void await(CountDownLatch latch, String what) throws InterruptedException {
+        assertTrue(latch.await(LIMIT.toMillis(), TimeUnit.MILLISECONDS), what + " within " + LIMIT);
     }
 
     private static void rethrow(AtomicReference<Throwable> failure) {
@@ -321,6 +351,135 @@ class MpscIoFairnessTest {
             long waitedMillis = TimeUnit.NANOSECONDS.toMillis(returnedAt.get() - writtenAt);
             assertTrue(waitedMillis < timeoutMillis / 2,
                     "read returned " + waitedMillis + " ms after the write, timeout " + timeoutMillis);
+        }
+    }
+
+    /**
+     * The carriers a thread X ran on: first, after an unpark by a virtual thread on
+     * another carrier (the waker's carrier is recorded too), after a sleep, and after
+     * a socket read. Every carrier runs yielders throughout, started from as many
+     * platform threads, so that no carrier runs dry and steals.
+     */
+    private record Placement(Thread first, Thread waker, Thread afterUnpark,
+                             Thread afterSleep, Thread afterRead) { }
+
+    private static Placement runPlacement() throws Exception {
+        try (SocketPair pair = SocketPair.open()) {
+            Thread[] ranOn = new Thread[4];
+            AtomicBoolean woken = new AtomicBoolean();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            CountDownLatch started = new CountDownLatch(1);
+            CountDownLatch unparked = new CountDownLatch(1);
+            CountDownLatch reading = new CountDownLatch(1);
+            Thread x = Thread.ofVirtual().start(() -> {
+                try {
+                    ranOn[0] = currentCarrierThread();
+                    started.countDown();
+                    while (!woken.get()) {
+                        LockSupport.park();
+                    }
+                    ranOn[1] = currentCarrierThread();
+                    unparked.countDown();
+                    Thread.sleep(20);
+                    ranOn[2] = currentCarrierThread();
+                    reading.countDown();
+                    int b = pair.in().read();
+                    ranOn[3] = currentCarrierThread();
+                    assertEquals(42, b);
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            });
+
+            AtomicBoolean stop = new AtomicBoolean();
+            AtomicBoolean unparkRequested = new AtomicBoolean();
+            AtomicBoolean claimed = new AtomicBoolean();
+            AtomicReference<Thread> waker = new AtomicReference<>();
+            Set<Thread> seen = ConcurrentHashMap.newKeySet();
+            CountDownLatch allCarriersBusy = new CountDownLatch(1);
+            var yielders = new ArrayList<Thread>();
+            try {
+                await(started, "X started");
+                awaitWaiting(x);
+                Thread home = ranOn[0];
+                Runnable yielder = () -> {
+                    while (!stop.get()) {
+                        Thread c = currentCarrierThread();
+                        if (seen.add(c) && seen.size() == PARALLELISM) {
+                            allCarriersBusy.countDown();
+                        }
+                        if (unparkRequested.get() && (c != home || PARALLELISM == 1)
+                                && claimed.compareAndSet(false, true)) {
+                            waker.set(c);
+                            woken.set(true);
+                            LockSupport.unpark(x);
+                        }
+                        Thread.yield();
+                    }
+                };
+                // a platform thread starts its virtual threads on one carrier: one per
+                // starter, so that consecutive starters cover every carrier
+                for (int i = 0; i < 2 * PARALLELISM; i++) {
+                    var starter = Thread.ofPlatform().start(
+                            () -> yielders.add(Thread.ofVirtual().start(yielder)));
+                    starter.join();
+                }
+                await(allCarriersBusy, "yielders on every carrier");
+                unparkRequested.set(true);
+                await(unparked, "X ran after the unpark");
+                await(reading, "X ran after the sleep");
+                awaitWaiting(x);
+                pair.out().write(42);
+                assertTrue(x.join(LIMIT), "X not served within " + LIMIT);
+            } finally {
+                stop.set(true);
+                for (Thread t : yielders) {
+                    t.join();
+                }
+                x.join();
+            }
+            rethrow(failure);
+            return new Placement(ranOn[0], waker.get(), ranOn[1], ranOn[2], ranOn[3]);
+        }
+    }
+
+    /**
+     * An unpark by a virtual thread on another carrier queues the thread on the
+     * waker's carrier with stealing, on its home otherwise.
+     */
+    @Test
+    void testVtWakePlacement() throws Exception {
+        Placement p = runPlacement();
+        if (STEAL) {
+            assertSame(p.waker(), p.afterUnpark(), p.toString());
+        } else {
+            assertSame(p.first(), p.afterUnpark(), p.toString());
+        }
+    }
+
+    /**
+     * A timer's wake goes to the carrier the thread last ran on.
+     */
+    @Test
+    void testTimerWakeGoesToLastCarrier() throws Exception {
+        Placement p = runPlacement();
+        assertSame(p.afterUnpark(), p.afterSleep(), p.toString());
+        if (STEAL) {
+            assertSame(p.waker(), p.afterSleep(), p.toString());
+        } else {
+            assertSame(p.first(), p.afterSleep(), p.toString());
+        }
+    }
+
+    /**
+     * Readiness is delivered; without stealing, or with one carrier, the thread runs
+     * on the carrier it read on, where a thief cannot take it.
+     */
+    @Test
+    void testReadinessStaysOnPollingCarrier() throws Exception {
+        Placement p = runPlacement();
+        if (!STEAL || PARALLELISM == 1) {
+            assertSame(p.afterSleep(), p.afterRead(), p.toString());
         }
     }
 }

@@ -113,8 +113,9 @@ final class MpscVirtualThreadScheduler
     }
 
     static final class MpscTask extends VirtualThread.VThreadTask {
-        // plain: written on start before the first offer and by a thief before it runs the
-        // thread; a submitter reads it after the thread's state change that follows that run
+        // plain: written on start before the first offer, by a submitter that moves the
+        // thread before its offer, and by a thief before it runs the thread; a submitter
+        // reads it after the thread's state change that follows that run
         private MpscCarrierThread home;
 
         MpscTask(VirtualThread vthread) {
@@ -157,6 +158,13 @@ final class MpscVirtualThreadScheduler
         if (home == null) {
             onStart(task);
             return;
+        }
+        // without stealing nothing would move the thread off a carrier whose waker
+        // never unmounts, so only with stealing does a wake made on a carrier move it
+        if (STEAL && Thread.currentCarrierThread() instanceof MpscCarrierThread ct
+                && ct != home && ct.belongsTo(this)) {
+            setHome(task, ct);
+            home = ct;
         }
         boolean yielded = task instanceof VirtualThread.VThreadTask t && t.isYielded();
         // the carrier a thread yielded on resubmits it, and that carrier is its home
