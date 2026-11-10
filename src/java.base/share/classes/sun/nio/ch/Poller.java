@@ -119,6 +119,16 @@ public abstract class Poller {
     }
 
     /**
+     * Whether Mode 3 can be used: not with a built-in scheduler whose carriers can own
+     * local pollers (MPSC), which ignores the preferred carrier of Mode 3's read pollers.
+     */
+    private static boolean pollerPerCarrier() {
+        // continuations first: without them, the built-in scheduler is not initialized here
+        return !ContinuationSupport.isSupported()
+                || !(JLA.builtinVirtualThreadScheduler() instanceof LocalPoller.Scheduler);
+    }
+
+    /**
      * Create and return the PollerGroup.
      */
     private static PollerGroup createPollerGroup() {
@@ -129,7 +139,14 @@ public abstract class Poller {
                 mode = switch (s) {
                     case "1" -> Mode.SYSTEM_THREADS;
                     case "2" -> Mode.VTHREAD_POLLERS;
-                    case "3" -> Mode.POLLER_PER_CARRIER;
+                    case "3" -> {
+                        if (pollerPerCarrier()) {
+                            yield Mode.POLLER_PER_CARRIER;
+                        }
+                        System.err.println("WARNING: jdk.pollerMode=3 is not supported by "
+                                + "the MPSC scheduler; using the default poller mode");
+                        yield null;
+                    }
                     case "4" -> {
                         if (carrierLocalPollers()) {
                             yield Mode.CARRIER_LOCAL_POLLER;

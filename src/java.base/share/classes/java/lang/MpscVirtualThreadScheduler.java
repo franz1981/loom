@@ -42,6 +42,8 @@ import sun.nio.ch.LocalPollers;
  * <p>Mode 4 (CARRIER_LOCAL_POLLER) is the default where available (Linux, with
  * continuations, jdk.pollerMode unset or 4): each carrier owns a LocalPoller that VT
  * fds register with directly, and alternates rounds of its queues with polls.
+ * Mode 3 is not supported: jdk.pollerMode=3 falls back, with a warning, to the
+ * platform's default poller mode.
  *
  * <p>A yield resubmits the thread. Without stealing, in Mode 4 a thread is held by
  * its carrier and runs at the end of the next round, after everything queued before

@@ -87,7 +87,7 @@ public interface LocalPoller {
     /**
      * Marker for a built-in virtual thread scheduler whose carriers own local
      * pollers when {@link LocalPollers#enabled()} is true. Poller selects Mode 4
-     * only for such a scheduler.
+     * only for such a scheduler, and never Mode 3.
      */
     interface Scheduler { }
 }
