@@ -57,7 +57,8 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>With stealing, a task is announced unless it is the next task its owner runs:
  *     by its producer when that is another thread (or by the owner after WAKING, for
  *     it), else by the owner before it runs the next task.
- * <li>With stealing, the owner and thieves consume the queue in turns (stealLock).
+ * <li>With stealing the queue is shared: the owner (pollShared) and thieves
+ *     (trySteal) consume it in turns under stealLock.
  * <li>With stealing, the owner's own thread offers tasks only with no thread mounted
  *     (after a continuation unmounts, or from its polls), never from a task's code;
  *     run(task) is the only place a task runs.
@@ -187,7 +188,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     void submit(VirtualThreadTask task) {
         if (STEAL) {
-            offerStealable(task);
+            offerShared(task);
         } else {
             offer(task);
         }
@@ -204,7 +205,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         }
     }
 
-    private void offerStealable(VirtualThreadTask task) {
+    private void offerShared(VirtualThreadTask task) {
         queue.offer(task);
         if (Thread.currentThread() == this) {
             unannounced = true;
@@ -212,7 +213,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         }
         int state = carrierState;
         if (state == PARKED) {
-            if (wakeParked() == RUNNING && hasStealable()) {
+            if (wakeParked() == RUNNING && hasQueued()) {
                 gate.signal(this);
             }
         } else if (state != WAKING) {
@@ -426,7 +427,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         int quota = queue.size();
         int ran = 0;
         VirtualThreadTask task;
-        for (int i = 0; i < quota && (task = pollStealable()) != null; i++) {
+        for (int i = 0; i < quota && (task = pollShared()) != null; i++) {
             run(task);
             ran++;
         }
@@ -442,7 +443,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private void run(VirtualThreadTask task) {
         if (unannounced) {
             unannounced = false;
-            if (hasStealable()) {
+            if (hasQueued()) {
                 gate.signal(this);
             }
         }
@@ -451,7 +452,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     /** Still PARKED: rechecks its own queue, then tries one steal; false to block. */
     private boolean workBeforeBlocking() {
-        VirtualThreadTask task = pollStealable();
+        VirtualThreadTask task = pollShared();
         if (task != null) {
             abortPark();
             run(task);
@@ -461,7 +462,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         if (victim != null && (task = victim.trySteal()) != null) {
             abortPark();
             // no fence before the emptiness test, as in SearchGate.handOn
-            if (victim.hasStealable()) {
+            if (victim.hasQueued()) {
                 gate.signal(victim);
             }
             runStolen(task);
@@ -472,7 +473,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     /** Keeps one task of the backlog for itself unless it has a task in hand. */
     private void announceBacklog(boolean taskInHand) {
-        int backlog = stealableBacklog();
+        int backlog = queuedEstimate();
         if (backlog > 1 || (backlog == 1 && taskInHand)) {
             gate.signal(this);
         }
@@ -494,7 +495,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
         run(task);
     }
 
-    private VirtualThreadTask pollStealable() {
+    private VirtualThreadTask pollShared() {
         while (!STEAL_LOCK.compareAndSet(this, 0, 1)) {
             Thread.onSpinWait();
         }
@@ -505,11 +506,11 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     // ---- The queue as other carriers and SearchGate see it ----
 
-    int stealableBacklog() {
+    int queuedEstimate() {
         return queue.sizeEstimate();
     }
 
-    boolean hasStealable() {
+    boolean hasQueued() {
         return !queue.isEmpty();
     }
 

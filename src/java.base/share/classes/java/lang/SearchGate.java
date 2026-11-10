@@ -122,7 +122,7 @@ final class SearchGate {
 
     /** Called by the searcher after its steal; releases the token if it cannot pass it. */
     void handOn(MpscCarrierThread victim, int r) {
-        if (!victim.hasStealable() || placeSearcher(victim, r, true)) {
+        if (!victim.hasQueued() || placeSearcher(victim, r, true)) {
             release(r);
         }
     }
@@ -171,7 +171,7 @@ final class SearchGate {
             }
             MpscCarrierThread c = carriers[j];
             if (c != self) {
-                int size = c.stealableBacklog();
+                int size = c.queuedEstimate();
                 if (size > bestSize) {
                     best = c;
                     bestSize = size;
