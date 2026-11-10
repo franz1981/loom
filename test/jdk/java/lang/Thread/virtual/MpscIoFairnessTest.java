@@ -138,6 +138,32 @@
  *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscIoFairnessTest
  */
 
+/*
+ * @test id=mode4-one-carrier-long-interval
+ * @summary A poll interval of two seconds: a poll that fills its event array is
+ *          followed by another at the next task boundary
+ * @requires vm.continuations & os.family == "linux"
+ * @modules java.base/java.lang:+open
+ * @run junit/othervm -esa
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=false
+ *                    -Djdk.pollerMode=4
+ *                    -Djdk.virtualThreadScheduler.mpscMaxPollIntervalMicros=2000000
+ *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscIoFairnessTest
+ */
+
+/*
+ * @test id=mode4-steal-one-carrier-long-interval
+ * @requires vm.continuations & os.family == "linux"
+ * @modules java.base/java.lang:+open
+ * @run junit/othervm -esa
+ *                    -Djdk.virtualThreadScheduler.useMpsc=true
+ *                    -Djdk.virtualThreadScheduler.mpscSteal=true
+ *                    -Djdk.pollerMode=4
+ *                    -Djdk.virtualThreadScheduler.mpscMaxPollIntervalMicros=2000000
+ *                    -Djdk.virtualThreadScheduler.parallelism=1 MpscIoFairnessTest
+ */
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -454,6 +480,67 @@ class MpscIoFairnessTest {
             assertTrue(waitedMillis < timeoutMillis / 2,
                     "read returned " + waitedMillis + " ms after the write, timeout " + timeoutMillis);
         }
+    }
+
+    /**
+     * More fds become ready at once than one poll returns (64) while the carrier's
+     * queue never empties: after a poll that fills its event array the carrier polls
+     * again at the next task boundaries, so every reader is served soon after the
+     * first poll that finds them, not one array per poll interval. Runs only with a
+     * poll interval of at most ten seconds set, long enough to tell the two apart.
+     */
+    @Test
+    void testFullPollIsFollowedByAnother() throws Exception {
+        assumeTrue(POLL_INTERVAL_MICROS != null && POLL_INTERVAL_MICROS <= 10_000_000,
+                "needs a long poll interval set");
+        long intervalMillis = POLL_INTERVAL_MICROS / 1000;
+        int count = 200;
+        var pairs = new ArrayList<SocketPair>();
+        var readers = new ArrayList<Thread>();
+        AtomicBoolean stop = new AtomicBoolean();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CountDownLatch served = new CountDownLatch(count);
+        List<Thread> chains = List.of();
+        boolean allServed;
+        long elapsedMillis;
+        try {
+            for (int i = 0; i < count; i++) {
+                pairs.add(SocketPair.open());
+            }
+            chains = wakeChains(stop);
+            for (SocketPair pair : pairs) {
+                readers.add(Thread.ofVirtual().start(() -> {
+                    try {
+                        assertEquals(42, pair.in().read());
+                        served.countDown();
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    }
+                }));
+            }
+            for (Thread reader : readers) {
+                awaitReadPark(reader);
+            }
+            long start = System.nanoTime();
+            for (SocketPair pair : pairs) {
+                pair.out().write(42);
+            }
+            allServed = served.await(LIMIT.toMillis(), TimeUnit.MILLISECONDS);
+            elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        } finally {
+            stopAll(stop, chains);
+            for (SocketPair pair : pairs) {
+                pair.close();
+            }
+            for (Thread reader : readers) {
+                reader.join();
+            }
+        }
+        rethrow(failure);
+        assertTrue(allServed, (count - served.getCount()) + " of " + count
+                + " readers served within " + LIMIT);
+        assertTrue(elapsedMillis < intervalMillis * 3 / 2, count + " readers served in "
+                + elapsedMillis + " ms, poll interval " + intervalMillis + " ms");
     }
 
     /**
