@@ -249,6 +249,12 @@ final class MpscUnboundedQueue<E> {
     }
 
     private void resize(long oldMask, E[] oldBuffer, long pIndex, final E e) {
+        final long availableInQueue = Integer.MAX_VALUE - (pIndex - lvConsumerIndex());
+        if (availableInQueue <= 0) {
+            soProducerIndex(pIndex);        // as on out of memory: the resize bit must not stay set
+            throw new IllegalStateException();
+        }
+
         int newBufferLength = oldBuffer.length;
         final E[] newBuffer;
         try {
@@ -273,12 +279,6 @@ final class MpscUnboundedQueue<E> {
 
         soRefElement(newBuffer, offsetInNew, e);
         soRefElement(oldBuffer, nextArrayOffset(oldMask), newBuffer);
-
-        final long cIndex = lvConsumerIndex();
-        final long availableInQueue = Integer.MAX_VALUE - (pIndex - cIndex);
-        if (availableInQueue <= 0) {
-            throw new IllegalStateException();
-        }
 
         soProducerLimit(pIndex + Math.min(newMask, availableInQueue));
         soProducerIndex(pIndex + 2);
