@@ -31,11 +31,14 @@ import jdk.internal.vm.annotation.Contended;
 import static java.lang.MpscVirtualThreadScheduler.STEAL;
 
 /**
- * Multi-producer unbounded array queue using VarHandles, based on JCTools
- * MpscUnboundedArrayQueue but self-contained. Without stealing it has one consumer,
- * which calls {@link #poll()}. With {@link MpscVirtualThreadScheduler#STEAL} any number
- * of consumers call {@link #take(boolean)}: a consumer claims an element by a CAS on the
- * consumer index and then clears its slot. The two are never mixed on one queue.
+ * Multi-producer unbounded queue of linked array chunks using VarHandles, based on JCTools
+ * MpscUnboundedArrayQueue but self-contained. Without stealing it has one consumer, which calls
+ * {@link #poll()}. With {@link MpscVirtualThreadScheduler#STEAL} any number of consumers call
+ * {@link #take(boolean)}: a consumer claims an element by a CAS on the consumer index and then
+ * clears its slot. The two are never mixed on one queue.
+ *
+ * <p>A chunk holds its ring slots, the link to the next chunk, and, with stealing, its first
+ * index as a Long (none in the first chunk).
  *
  * <p>Memory order: a write in release mode or stronger, read by a read in acquire mode
  * or stronger, is taken to give happens-before between them (the VarHandle access-mode
@@ -44,9 +47,14 @@ import static java.lang.MpscVirtualThreadScheduler.STEAL;
  * <p>Invariants with stealing:
  * <ul>
  * <li>A lost claim CAS means another consumer took that index.
- * <li>A slot is written only when it is clear: an offer waits for the clear of the
- *     consumer that claimed that slot's element one lap back.
- * <li>A claim trusts a slot only below a producer index it observed.
+ * <li>A slot is written only when it is clear: an offer whose slot still holds an element
+ *     starts a new chunk at its index instead. No JUMP is written.
+ * <li>An index belongs to the chunk whose start is at or below it and whose successor's start
+ *     is above it.
+ * <li>A consumer reads a slot only below the smaller of a producer index it read, without the
+ *     resize bit, and the start of the chunk's successor.
+ * <li>A producer waits only for another producer's resize. A consumer waits only for a producer
+ *     between its index CAS and its store, or for a resizer.
  * </ul>
  *
  * @param <E> the type of elements held in this queue
@@ -100,9 +108,10 @@ final class MpscUnboundedQueue<E> {
     private long consumerMask;
     @Contended("consumer")
     private E[] consumerBuffer;
-    // take(true) only, on the queue's carrier: a producer index it read
+    // take(true) only, on the queue's carrier: below this index the owner reads slots without
+    // reading the producer index (see the class doc)
     @Contended("consumer")
-    private long ownerProducerIndex;
+    private long ownerTrusted;
 
     MpscUnboundedQueue(int initialCapacity) {
         if (initialCapacity < 2) {
@@ -111,7 +120,7 @@ final class MpscUnboundedQueue<E> {
         int p2capacity = roundToPowerOfTwo(initialCapacity);
         long mask = (p2capacity - 1L) << 1;
         @SuppressWarnings("unchecked")
-        E[] buffer = (E[]) new Object[p2capacity + 1];
+        E[] buffer = (E[]) new Object[p2capacity + 2];
         producerBuffer = buffer;
         consumerBuffer = buffer;
         producerMask = mask;
@@ -185,21 +194,22 @@ final class MpscUnboundedQueue<E> {
             long producerLimit = lvProducerLimit();
             pIndex = lvProducerIndex();
             if ((pIndex & RESIZE_BIT) == 1) {
+                Thread.onSpinWait();          // another producer is inside its resize
                 continue;
             }
 
             mask = this.producerMask;
             buffer = this.producerBuffer;
 
-            // With stealing, the consumer that took this slot's element one lap back clears it
-            // after its claim: never write over it, or that clear erases this element. Keep the
-            // check before the limit test: it also guards the slot that receives JUMP on a resize,
-            // which is what lets take count an index with the resize bit set as one more element.
+            // With stealing a consumer clears its slot after its claim, so the element one lap back
+            // may still be here, and that late clear would erase anything stored now: this index
+            // starts a new chunk instead. Every path to the index CAS below passes this check.
             if (STEAL && lvRefElement(buffer, modifiedCalcCircularRefElementOffset(pIndex, mask)) != null) {
-                if (lvProducerIndex() == pIndex) {
-                    Thread.onSpinWait();      // that consumer is between its claim and its clear
+                if (casProducerIndex(pIndex, pIndex + 1)) {
+                    resize(mask, buffer, pIndex, e);
+                    return;
                 }
-                continue;                     // else pIndex was stale: retry at once
+                continue;
             }
 
             if (producerLimit <= pIndex) {
@@ -244,6 +254,9 @@ final class MpscUnboundedQueue<E> {
         try {
             @SuppressWarnings("unchecked")
             E[] b = (E[]) new Object[newBufferLength];
+            if (STEAL) {
+                ((Object[]) b)[startOffset(b)] = Long.valueOf(pIndex);   // published by the link's release store
+            }
             newBuffer = b;
         } catch (OutOfMemoryError oome) {
             // only the resizer changes the producer index while the resize bit is set:
@@ -253,10 +266,9 @@ final class MpscUnboundedQueue<E> {
         }
 
         producerBuffer = newBuffer;
-        final int newMask = (newBufferLength - 2) << 1;
+        final int newMask = (newBufferLength - 3) << 1;
         producerMask = newMask;
 
-        final int offsetInOld = modifiedCalcCircularRefElementOffset(pIndex, oldMask);
         final int offsetInNew = modifiedCalcCircularRefElementOffset(pIndex, newMask);
 
         soRefElement(newBuffer, offsetInNew, e);
@@ -270,11 +282,19 @@ final class MpscUnboundedQueue<E> {
 
         soProducerLimit(pIndex + Math.min(newMask, availableInQueue));
         soProducerIndex(pIndex + 2);
-        soRefElement(oldBuffer, offsetInOld, JUMP);
+        if (!STEAL) {
+            // with stealing the slot at pIndex may still hold a claimed element: consumers find
+            // the new chunk by its start instead
+            soRefElement(oldBuffer, modifiedCalcCircularRefElementOffset(pIndex, oldMask), JUMP);
+        }
     }
 
     private int nextArrayOffset(final long mask) {
         return modifiedCalcCircularRefElementOffset(mask + 2, Long.MAX_VALUE);
+    }
+
+    private static int startOffset(Object[] buffer) {
+        return buffer.length - 1;
     }
 
     private static int modifiedCalcCircularRefElementOffset(long index, long mask) {
@@ -312,58 +332,65 @@ final class MpscUnboundedQueue<E> {
         @SuppressWarnings("unchecked")
         final E[] nextBuffer = (E[]) lvRefElement(buffer, nextArrayOffset);
         consumerBuffer = nextBuffer;
-        consumerMask = (nextBuffer.length - 2L) << 1;
+        consumerMask = (nextBuffer.length - 3L) << 1;
         soRefElement(buffer, nextArrayOffset, BUFFER_CONSUMED);
         return nextBuffer;
     }
 
     /**
      * With stealing: takes the element at the consumer index, racing other consumers.
-     * Returns null only if the queue was empty at a read made during this call; waits
-     * for a producer whose index claim is done and whose store is not. owner: the caller
-     * is this queue's carrier.
+     * Returns null only if the queue was empty at a read made during this call. Waits for a
+     * producer between its index claim and its store, and for a resizer that holds the index.
+     * owner: the caller is this queue's carrier.
      */
     @SuppressWarnings("unchecked")
     E take(boolean owner) {
         for (;;) {
+            // the index before the buffer: the buffer read is then the index's chunk or a later one
             long index = (long) CONSUMER_INDEX.getVolatile(this);
-            long pIndex = owner ? ownerProducerIndex : 0L;
-            if (index >= pIndex) {
-                pIndex = lvProducerIndex();
-                pIndex += (pIndex & RESIZE_BIT);
-                if (index >= pIndex) {
+            E[] buffer = (E[]) CONSUMER_BUFFER.getAcquire(this);
+            long trusted = owner ? ownerTrusted : 0L;
+            if (index >= trusted) {
+                // the producer index before the link: an unlinked chunk then holds every index below it
+                long pIndex = lvProducerIndex();
+                if (index >= pIndex + (pIndex & RESIZE_BIT)) {
                     return null;
                 }
-                if (owner) {
-                    ownerProducerIndex = pIndex;
-                }
-            }
-            E[] buffer = (E[]) CONSUMER_BUFFER.getAcquire(this);
-            long mask = (buffer.length - 2L) << 1;
-            int offset = modifiedCalcCircularRefElementOffset(index, mask);
-            Object e = lvRefElement(buffer, offset);
-            if (e == null || e == JUMP) {
-                // another consumer took index; this re-read also stops a consumer whose index is
-                // a lap stale from moving consumerBuffer on the next lap's JUMP, a lap early
-                if ((long) CONSUMER_INDEX.getVolatile(this) != index) {
+                trusted = pIndex & ~RESIZE_BIT;
+                int link = nextArrayOffset((buffer.length - 3L) << 1);
+                Object next = lvRefElement(buffer, link);
+                if (next == BUFFER_CONSUMED) {
                     continue;
                 }
-                if (e == null) {
-                    if (owner) {
-                        ownerProducerIndex = index;    // read the producer index again: an offer can roll back
+                if (next != null) {
+                    long start = (Long) lvRefElement((Object[]) next, startOffset((Object[]) next));
+                    if (index >= start) {
+                        if (CONSUMER_BUFFER.compareAndSet(this, buffer, (E[]) next)) {
+                            soRefElement(buffer, link, BUFFER_CONSUMED);
+                        }
+                        continue;
                     }
-                    Thread.onSpinWait();               // its producer has claimed it and not stored it yet
-                } else {
-                    int link = nextArrayOffset(mask);
-                    Object next = lvRefElement(buffer, link);
-                    if (next != BUFFER_CONSUMED && CONSUMER_BUFFER.compareAndSet(this, buffer, (E[]) next)) {
-                        soRefElement(buffer, link, BUFFER_CONSUMED);
-                    }
+                    trusted = Math.min(trusted, start);
+                }
+                if (index >= trusted) {
+                    Thread.onSpinWait();               // a resizer holds index
+                    continue;
+                }
+                if (owner) {
+                    ownerTrusted = trusted;
+                }
+            }
+            long mask = (buffer.length - 3L) << 1;
+            int offset = modifiedCalcCircularRefElementOffset(index, mask);
+            Object e = lvRefElement(buffer, offset);
+            if (e == null) {
+                if ((long) CONSUMER_INDEX.getVolatile(this) == index) {
+                    Thread.onSpinWait();               // its producer has claimed index and not stored it yet
                 }
                 continue;
             }
             if (CONSUMER_INDEX.compareAndSet(this, index, index + 2)) {
-                soRefElement(buffer, offset, null);    // the producer one lap on waits for this
+                soRefElement(buffer, offset, null);
                 return (E) e;
             }
         }
