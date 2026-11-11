@@ -102,7 +102,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
             Long.getLong("jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros", 500L)));
 
     final int id;
-    private final MpscUnboundedQueue<VirtualThreadTask> queue = new MpscUnboundedQueue<>(64);
+    private final MpscUnboundedQueue<VirtualThreadTask> queue = new MpscUnboundedQueue<>(64, 64);
     private final MpscVirtualThreadScheduler scheduler;
     private final IdleSet idleSet;
     private final SearchGate gate;

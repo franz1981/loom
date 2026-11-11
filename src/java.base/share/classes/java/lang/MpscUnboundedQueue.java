@@ -32,13 +32,21 @@ import static java.lang.MpscVirtualThreadScheduler.STEAL;
 
 /**
  * Multi-producer unbounded queue of linked array chunks using VarHandles, based on JCTools
- * MpscUnboundedArrayQueue but self-contained. Without stealing it has one consumer, which calls
- * {@link #poll()}. With {@link MpscVirtualThreadScheduler#STEAL} any number of consumers call
- * {@link #take(boolean)}: a consumer claims an element by a CAS on the consumer index and then
- * clears its slot. The two are never mixed on one queue.
+ * MpscUnboundedArrayQueue and MpscGrowableArrayQueue but self-contained. Without stealing it has
+ * one consumer, which calls {@link #poll()}. With {@link MpscVirtualThreadScheduler#STEAL} any
+ * number of consumers call {@link #take(boolean)}: a consumer claims an element by a CAS on the
+ * consumer index and then clears its slot. The two are never mixed on one queue.
  *
  * <p>A chunk holds its ring slots, the link to the next chunk, and, with stealing, its first
  * index as a Long (none in the first chunk).
+ *
+ * <p>The first chunk has the initial capacity. A full ring doubles the next chunk's capacity up to
+ * the maximum chunk capacity; an offer that meets a held slot starts a chunk of the same length.
+ * Chunk lengths never decrease along the chain, so a producer limit read in an earlier chunk is
+ * still valid in a later one. In a shorter chunk, a producer holding a limit read in a longer one
+ * could write a slot whose claimant has not stored yet, and that store would then overwrite it.
+ * The maximum chunk capacity bounds chunks, not elements: the queue holds fewer than about 2^30
+ * elements, and an offer beyond that throws IllegalStateException.
  *
  * <p>Memory order: a write in release mode or stronger, read by a read in acquire mode
  * or stronger, is taken to give happens-before between them (the VarHandle access-mode
@@ -96,8 +104,6 @@ final class MpscUnboundedQueue<E> {
     @SuppressWarnings("FieldMayBeFinal")
     private long producerLimit;
     @Contended("producer")
-    private long producerMask;
-    @Contended("producer")
     private E[] producerBuffer;
 
     // consumer-written fields
@@ -113,17 +119,26 @@ final class MpscUnboundedQueue<E> {
     @Contended("consumer")
     private long ownerTrusted;
 
-    MpscUnboundedQueue(int initialCapacity) {
+    // the largest maximum chunk capacity: a chunk's mask, (capacity - 1) << 1, must fit an int
+    static final int MAX_CHUNK_CAPACITY = 1 << 30;
+
+    // a full ring doubles the chunk capacity up to this, a power of 2
+    private final int maxChunkCapacity;
+
+    MpscUnboundedQueue(int initialCapacity, int maxChunkCapacity) {
         if (initialCapacity < 2) {
             throw new IllegalArgumentException("Initial capacity must be 2 or more");
         }
+        if (maxChunkCapacity < initialCapacity || maxChunkCapacity > MAX_CHUNK_CAPACITY) {
+            throw new IllegalArgumentException("Maximum chunk capacity must be in [initial capacity, 2^30]");
+        }
         int p2capacity = roundToPowerOfTwo(initialCapacity);
+        this.maxChunkCapacity = roundToPowerOfTwo(maxChunkCapacity);
         long mask = (p2capacity - 1L) << 1;
         @SuppressWarnings("unchecked")
         E[] buffer = (E[]) new Object[p2capacity + 2];
         producerBuffer = buffer;
         consumerBuffer = buffer;
-        producerMask = mask;
         consumerMask = mask;
         soProducerLimit(mask);
     }
@@ -198,15 +213,17 @@ final class MpscUnboundedQueue<E> {
                 continue;
             }
 
-            mask = this.producerMask;
             buffer = this.producerBuffer;
+            // the mask of this buffer: a separately read mask can belong to a chunk of another
+            // length, and the held-slot read below comes before the CAS that would reject the pair
+            mask = (buffer.length - 3L) << 1;
 
             // With stealing a consumer clears its slot after its claim, so the element one lap back
             // may still be here, and that late clear would erase anything stored now: this index
             // starts a new chunk instead. Every path to the index CAS below passes this check.
             if (STEAL && lvRefElement(buffer, modifiedCalcCircularRefElementOffset(pIndex, mask)) != null) {
                 if (casProducerIndex(pIndex, pIndex + 1)) {
-                    resize(mask, buffer, pIndex, e);
+                    resize(mask, buffer, pIndex, e, false);
                     return;
                 }
                 continue;
@@ -220,7 +237,7 @@ final class MpscUnboundedQueue<E> {
                     case RETRY:
                         continue;
                     case QUEUE_RESIZE:
-                        resize(mask, buffer, pIndex, e);
+                        resize(mask, buffer, pIndex, e, true);
                         return;
                 }
             }
@@ -248,14 +265,19 @@ final class MpscUnboundedQueue<E> {
         return RETRY;
     }
 
-    private void resize(long oldMask, E[] oldBuffer, long pIndex, final E e) {
+    private void resize(long oldMask, E[] oldBuffer, long pIndex, final E e, boolean grow) {
         final long availableInQueue = Integer.MAX_VALUE - (pIndex - lvConsumerIndex());
         if (availableInQueue <= 0) {
             soProducerIndex(pIndex);        // as on out of memory: the resize bit must not stay set
             throw new IllegalStateException();
         }
 
-        int newBufferLength = oldBuffer.length;
+        int capacity = oldBuffer.length - 2;
+        // a held slot keeps the length: a stalled claimant costs a chunk of this length
+        if (grow && capacity < maxChunkCapacity) {
+            capacity <<= 1;
+        }
+        int newBufferLength = capacity + 2;
         final E[] newBuffer;
         try {
             @SuppressWarnings("unchecked")
@@ -273,7 +295,6 @@ final class MpscUnboundedQueue<E> {
 
         producerBuffer = newBuffer;
         final int newMask = (newBufferLength - 3) << 1;
-        producerMask = newMask;
 
         final int offsetInNew = modifiedCalcCircularRefElementOffset(pIndex, newMask);
 
