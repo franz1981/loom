@@ -99,17 +99,14 @@ final class MpscUnboundedQueue<E> {
 
     // producer-written fields
     @Contended("producer")
-    @SuppressWarnings("FieldMayBeFinal")
     private long producerIndex;
     @Contended("producer")
-    @SuppressWarnings("FieldMayBeFinal")
     private long producerLimit;
     @Contended("producer")
     private E[] producerBuffer;
 
     // consumer-written fields
     @Contended("consumer")
-    @SuppressWarnings("FieldMayBeFinal")
     private long consumerIndex;
     @Contended("consumer")
     private long consumerMask;
@@ -145,9 +142,6 @@ final class MpscUnboundedQueue<E> {
     }
 
     private static int roundToPowerOfTwo(int value) {
-        if (value <= 0) {
-            throw new IllegalArgumentException("Must be positive");
-        }
         return 1 << (32 - Integer.numberOfLeadingZeros(value - 1));
     }
 
@@ -270,7 +264,7 @@ final class MpscUnboundedQueue<E> {
         final long availableInQueue = Integer.MAX_VALUE - (pIndex - lvConsumerIndex());
         if (availableInQueue <= 0) {
             soProducerIndex(pIndex);        // as on out of memory: the resize bit must not stay set
-            throw new IllegalStateException();
+            throw new IllegalStateException("queue is full");
         }
 
         int capacity = oldBuffer.length - 2;

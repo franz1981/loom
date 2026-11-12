@@ -865,7 +865,6 @@ public abstract class Poller {
         return POLLER_GROUP.writePollers();
     }
 
-
     // ---- CARRIER_LOCAL_POLLER group ----
 
     /**
@@ -918,24 +917,21 @@ public abstract class Poller {
             return readPollers[index];
         }
 
-        LocalPoller getLocalPoller() {
-            return (JLA.currentCarrierThread() instanceof LocalPoller.Carrier c)
-                    ? c.localPoller()
-                    : null;
-        }
-
-
         private Poller writePoller(int fdVal) {
             int index = provider().fdValToIndex(fdVal, writePollers.length);
             return writePollers[index];
         }
 
+        private LocalPoller getLocalPoller() {
+            return (JLA.currentCarrierThread() instanceof LocalPoller.Carrier c)
+                    ? c.localPoller()
+                    : null;
+        }
+
         @Override
         void poll(int fdVal, int event, long nanos, BooleanSupplier isOpen) throws IOException {
             // POLLIN from VT: register with carrier's local poller
-            if (event == Net.POLLIN
-                    && Thread.currentThread().isVirtual()
-                    && ContinuationSupport.isSupported()) {
+            if (event == Net.POLLIN && Thread.currentThread().isVirtual()) {
                 // pinned so that the poller is the one of the carrier that registers:
                 // only a poller's own carrier inserts into its fd map
                 LocalPoller poller;

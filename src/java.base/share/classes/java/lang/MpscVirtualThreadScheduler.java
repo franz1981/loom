@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.Thread.VirtualThreadScheduler;
 import java.lang.Thread.VirtualThreadTask;
+import java.util.concurrent.atomic.AtomicInteger;
 import sun.nio.ch.LocalPoller;
 import sun.nio.ch.LocalPollers;
 
@@ -71,6 +72,10 @@ final class MpscVirtualThreadScheduler
      */
     static final boolean STEAL = Boolean.parseBoolean(
             System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
+
+    // a sequence, as in ThreadLocalRandom.localInit: hashes of a few sequential thread
+    // ids spread poorly over a few carriers
+    private static final AtomicInteger PROBE_SEEDER = new AtomicInteger();
 
     private final MpscCarrierThread[] carriers;
 
@@ -190,11 +195,6 @@ final class MpscVirtualThreadScheduler
         }
         return carriers[Math.floorMod(probe(), carriers.length)];
     }
-
-    // a sequence, as in ThreadLocalRandom.localInit: hashes of a few sequential thread
-    // ids spread poorly over a few carriers
-    private static final java.util.concurrent.atomic.AtomicInteger PROBE_SEEDER =
-            new java.util.concurrent.atomic.AtomicInteger();
 
     /**
      * Stable for the calling platform thread's life, as ForkJoinPool's probe: a burst
