@@ -291,12 +291,7 @@ final class VirtualThread extends BaseVirtualThread {
         }
         /**
          * Whether the thread is unmounted after Thread.yield and not yet continued.
-         * Meaningful only to the built-in scheduler inside its onContinue for this
-         * task: there it is exact, because only the yield's own resubmit
-         * (afterYield, on the carrier the thread yielded on, or a custom scheduler
-         * forwarding it) submits a YIELDED thread, and only running this task
-         * leaves YIELDED. Anywhere else it reads a transient state that may change
-         * at any time.
+         * Exact only inside the built-in scheduler's onContinue for this task.
          */
         final boolean isYielded() {
             return vthread.state() == YIELDED;
@@ -1476,7 +1471,7 @@ final class VirtualThread extends BaseVirtualThread {
     }
 
     /**
-     * Creates the built-in ForkJoinPool scheduler.
+     * Creates the built-in scheduler.
      * @param wrapped true if wrapped by a custom default scheduler
      */
     private static BuiltinScheduler createBuiltinScheduler(boolean wrapped) {

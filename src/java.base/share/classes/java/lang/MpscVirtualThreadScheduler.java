@@ -49,16 +49,12 @@ import sun.nio.ch.LocalPollers;
  *
  * <p>Mode 4 (CARRIER_LOCAL_POLLER) is the default where available (Linux, with
  * continuations, jdk.pollerMode unset or 4): each carrier owns a LocalPoller that VT
- * fds register with directly, and polls it only when its queue is empty, at a task
- * boundary once a time bound has passed since its last poll, before it queues a
- * lone yielder, and blocking when it parks (see MpscCarrierThread).
+ * fds register with directly; see MpscCarrierThread for when it polls.
  * Mode 3 is not supported: jdk.pollerMode=3 falls back, with a warning, to the
  * platform's default poller mode.
  *
  * <p>A yield resubmits the thread to the tail of the queue of the carrier it yielded
- * on, its home. In Mode 4, when that queue is empty, the carrier first polls, so a
- * lone yielder gives way to ready I/O on every yield. A lone yielder never makes its
- * carrier block.
+ * on, its home.
  *
  * <p>With stealing, a producer wakes the home carrier if it is parked, else signals
  * (SearchGate); the owner announces its own submissions before its next task if they

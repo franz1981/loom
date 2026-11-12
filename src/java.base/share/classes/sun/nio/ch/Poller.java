@@ -870,8 +870,7 @@ public abstract class Poller {
 
     /**
      * Each carrier owns a local poller. VT fds register directly with the
-     * carrier's poller. No sub-pollers, no master poller. Write pollers are
-     * system-wide platform threads.
+     * carrier's poller. Write pollers are system-wide platform threads.
      */
     private static class CarrierLocalPollerGroup extends PollerGroup {
         // System-wide fallback pollers, in platform threads. The read pollers serve the

@@ -60,7 +60,8 @@ import static java.lang.MpscVirtualThreadScheduler.STEAL;
  * <li>An index belongs to the chunk whose start is at or below it and whose successor's start
  *     is above it.
  * <li>A consumer reads a slot only below the smaller of a producer index it read, without the
- *     resize bit, and the start of the chunk's successor.
+ *     resize bit, and the start of the chunk's successor. The owner (take(true)) keeps that
+ *     bound across takes, as ownerTrusted, and reads the producer index again only at it.
  * <li>A producer waits only for another producer's resize. A consumer waits only for a producer
  *     between its index CAS and its store, or for a resizer.
  * </ul>
@@ -115,7 +116,7 @@ final class MpscUnboundedQueue<E> {
     @Contended("consumer")
     private E[] consumerBuffer;
     // take(true) only, on the queue's carrier: below this index the owner reads slots without
-    // reading the producer index (see the class doc)
+    // reading the producer index
     @Contended("consumer")
     private long ownerTrusted;
 

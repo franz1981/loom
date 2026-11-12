@@ -34,7 +34,7 @@ import static sun.nio.ch.EPoll.*;
 /**
  * A carrier-local I/O poller using EPOLLONESHOT. Each carrier thread owns
  * one instance. VTs that park on I/O register their fd directly with the
- * carrier's epoll fd. No sub-pollers, no master poller.
+ * carrier's epoll fd.
  *
  * <p>Only the owning carrier calls {@link #poll(int)}, with no thread mounted:
  * without blocking between tasks (when the scheduler's rules say so), and blocking
@@ -79,11 +79,6 @@ final class CarrierLocalPoller implements LocalPoller {
         this.eventfd = eventfd;
     }
 
-    /**
-     * Register a file descriptor for read or write polling. Called by a VT mounted
-     * on this poller's carrier, with its continuation pinned, before parking: only
-     * this carrier inserts into the map. The VT is unparked when the fd is ready.
-     */
     @Override
     public void register(int fdVal, int event, Thread thread) throws IOException {
         fdToThread.put(fdVal, thread);
@@ -97,12 +92,8 @@ final class CarrierLocalPoller implements LocalPoller {
         }
     }
 
-    /**
-     * Deregister a file descriptor if the given thread's registration is still in
-     * place, i.e. it was unparked by something other than I/O readiness (interrupt,
-     * timeout). May be called from any carrier: the thread may run elsewhere by the
-     * time it deregisters (work stealing).
-     */
+    // may be called from any carrier: the thread may run elsewhere by the time it
+    // deregisters (work stealing)
     @Override
     public void deregister(int fdVal, Thread thread) {
         if (fdToThread.remove(fdVal, thread)) {
@@ -110,11 +101,6 @@ final class CarrierLocalPoller implements LocalPoller {
         }
     }
 
-    /**
-     * Poll for I/O events. Returns the number of VTs unparked.
-     *
-     * @param timeout milliseconds: -1 to block, 0 for non-blocking
-     */
     @Override
     public int poll(int timeout) throws IOException {
         if (timeout == 0 && fdToThread.isEmpty()) {
@@ -148,10 +134,6 @@ final class CarrierLocalPoller implements LocalPoller {
         return lastPollFilled;
     }
 
-    /**
-     * Wake the carrier from a blocking {@link #poll} call.
-     * Called by external threads submitting tasks to this carrier.
-     */
     @Override
     public void wakeup() throws IOException {
         eventfd.set();

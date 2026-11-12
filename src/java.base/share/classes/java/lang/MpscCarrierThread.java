@@ -68,10 +68,11 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <li>The queue is one live FIFO: a task runs after everything queued on this
  *     carrier before it, unless a thief takes it first. A runnable thread is in
  *     exactly one carrier's queue or is a task in hand; none is held aside.
- * <li>Mode 4: every task this carrier takes from its queue starts after a check of
- *     the poll interval, so a fd ready on its poller is polled at the first task
- *     boundary after the interval expires, or sooner when the queue empties; a poll
- *     that fills its event array leaves the interval expired.
+ * <li>Mode 4: every task this carrier takes at the top of its loop starts after a
+ *     check of the poll interval; a task taken while parking (a recheck of its
+ *     queue, or a steal) follows a poll. So a fd ready on its poller is polled at
+ *     the first task boundary after the interval expires, or sooner when the queue
+ *     empties; a poll that fills its event array leaves the interval expired.
  * <li>With stealing, a task is announced unless it is the next task its owner runs:
  *     by its producer when that is another thread (or by the owner after WAKING, for
  *     it), else by the owner before it runs the next task.
@@ -96,7 +97,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
 
     /**
      * Mode 4: how long a carrier whose queue does not empty runs tasks before it
-     * polls its poller, checked before each task it takes from its queue.
+     * polls its poller, checked before each task it takes at the top of its loop.
      */
     private static final long MAX_POLL_INTERVAL_NANOS = TimeUnit.MICROSECONDS.toNanos(Math.max(0L,
             Long.getLong("jdk.virtualThreadScheduler.mpscMaxPollIntervalMicros", 500L)));
