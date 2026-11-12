@@ -102,14 +102,9 @@ final class CarrierLocalPoller implements LocalPoller {
     }
 
     @Override
-    public int poll(int timeout) throws IOException {
-        if (timeout == 0 && fdToThread.isEmpty()) {
-            lastPollFilled = false;
-            return 0;
-        }
+    public void poll(int timeout) throws IOException {
         int n = EPoll.wait(epfd, pollAddress, MAX_EVENTS, timeout);
         lastPollFilled = (n == MAX_EVENTS);
-        int unparked = 0;
         for (int i = 0; i < n; i++) {
             long eventAddress = EPoll.getEvent(pollAddress, i);
             int fd = EPoll.getDescriptor(eventAddress);
@@ -117,11 +112,9 @@ final class CarrierLocalPoller implements LocalPoller {
                 Thread vt = fdToThread.take(fd);
                 if (vt != null) {
                     LockSupport.unpark(vt);
-                    unparked++;
                 }
             }
         }
-        return unparked;
     }
 
     @Override

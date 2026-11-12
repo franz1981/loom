@@ -57,9 +57,8 @@ public interface LocalPoller {
      * owning carrier only.
      *
      * @param timeout milliseconds: -1 to block, 0 for non-blocking
-     * @return the number of threads unparked
      */
-    int poll(int timeout) throws IOException;
+    void poll(int timeout) throws IOException;
 
     /**
      * Whether a file descriptor is registered and not yet polled ready or
