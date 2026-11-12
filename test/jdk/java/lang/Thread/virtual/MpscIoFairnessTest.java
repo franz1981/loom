@@ -192,8 +192,11 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class MpscIoFairnessTest {
+    // the jtreg timeout factor, read as jdk.test.lib.Utils.adjustTimeout reads it
+    private static final double TIMEOUT_FACTOR =
+            Double.parseDouble(System.getProperty("test.timeout.factor", "1.0"));
     // a hang fails by this limit, well inside the jtreg timeout
-    private static final Duration LIMIT = Duration.ofSeconds(10);
+    private static final Duration LIMIT = Duration.ofMillis(Math.round(10_000 * TIMEOUT_FACTOR));
     private static final boolean STEAL =
             Boolean.parseBoolean(
                     System.getProperty("jdk.virtualThreadScheduler.mpscSteal", "true"));
@@ -446,7 +449,7 @@ class MpscIoFairnessTest {
     @Test
     void testReadTimeoutNotSpurious() throws Exception {
         assumeDefaultPollInterval();
-        int timeoutMillis = 2_000;
+        int timeoutMillis = (int) Math.round(2_000 * TIMEOUT_FACTOR);
         try (SocketPair pair = SocketPair.open()) {
             pair.readerSide().setSoTimeout(timeoutMillis);
             AtomicBoolean stop = new AtomicBoolean();
@@ -540,7 +543,10 @@ class MpscIoFairnessTest {
         rethrow(failure);
         assertTrue(allServed, (count - served.getCount()) + " of " + count
                 + " readers served within " + LIMIT);
-        assertTrue(elapsedMillis < intervalMillis * 3 / 2, count + " readers served in "
+        // the slack stays below one interval: one event array per interval would take
+        // three intervals more for 200 readers
+        long slackMillis = Math.min(Math.round(intervalMillis / 2 * TIMEOUT_FACTOR), intervalMillis);
+        assertTrue(elapsedMillis < intervalMillis + slackMillis, count + " readers served in "
                 + elapsedMillis + " ms, poll interval " + intervalMillis + " ms");
     }
 
