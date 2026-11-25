@@ -225,8 +225,10 @@ class SynchronizedNative {
                 }
             }
         } finally {
-            // reset parallelism
-            VThreadRunner.setParallelism(previousParallelism);
+            // reset parallelism, if ensureParallelism changed it
+            if (previousParallelism < parallism) {
+                VThreadRunner.setParallelism(previousParallelism);
+            }
         }
     }
 

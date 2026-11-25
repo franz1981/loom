@@ -67,7 +67,7 @@ final class VirtualThread extends BaseVirtualThread {
     private static final Unsafe U = Unsafe.getUnsafe();
     private static final ContinuationScope VTHREAD_SCOPE = new ContinuationScope("VirtualThreads");
 
-    private static final VirtualThreadScheduler BUILTIN_SCHEDULER;
+    private static final BuiltinScheduler BUILTIN_SCHEDULER;
     private static final VirtualThreadScheduler DEFAULT_SCHEDULER;
     private static final VirtualThreadScheduler EXTERNAL_VIEW;
     private static final boolean USE_STPE;
@@ -75,7 +75,7 @@ final class VirtualThread extends BaseVirtualThread {
         // experimental
         String propValue = System.getProperty("jdk.virtualThreadScheduler.implClass");
         if (propValue != null) {
-            VirtualThreadScheduler builtinScheduler = createBuiltinScheduler(true);
+            BuiltinScheduler builtinScheduler = createBuiltinScheduler(true);
             VirtualThreadScheduler externalView = createExternalView(builtinScheduler);
             VirtualThreadScheduler defaultScheduler = loadCustomScheduler(externalView, propValue);
             BUILTIN_SCHEDULER = builtinScheduler;
@@ -267,7 +267,7 @@ final class VirtualThread extends BaseVirtualThread {
         this.cont = new VThreadContinuation(this, task);
 
         if (scheduler == BUILTIN_SCHEDULER) {
-            this.runContinuation = new VThreadTask(this);
+            this.runContinuation = BUILTIN_SCHEDULER.newTask(this);
         } else {
             this.runContinuation = new CustomVThreadTask(this, preferredCarrier);
         }
@@ -288,6 +288,13 @@ final class VirtualThread extends BaseVirtualThread {
         @Override
         public final void run() {
             vthread.runContinuation();;
+        }
+        /**
+         * Whether the thread is unmounted after Thread.yield and not yet continued.
+         * Exact only inside the built-in scheduler's onContinue for this task.
+         */
+        final boolean isYielded() {
+            return vthread.state() == YIELDED;
         }
         @Override
         public Thread preferredCarrier() {
@@ -311,6 +318,9 @@ final class VirtualThread extends BaseVirtualThread {
                 MhUtil.findVarHandle(MethodHandles.lookup(), "att", Object.class);
         private final Thread preferredCarrier;
         private volatile Object att;
+        // per-thread state of the built-in scheduler, when the custom scheduler
+        // delegates this task to it (through the external view)
+        Object builtinState;
         CustomVThreadTask(VirtualThread vthread, Thread preferredCarrier) {
             super(vthread);
             this.preferredCarrier = preferredCarrier;
@@ -1461,10 +1471,10 @@ final class VirtualThread extends BaseVirtualThread {
     }
 
     /**
-     * Creates the built-in ForkJoinPool scheduler.
+     * Creates the built-in scheduler.
      * @param wrapped true if wrapped by a custom default scheduler
      */
-    private static VirtualThreadScheduler createBuiltinScheduler(boolean wrapped) {
+    private static BuiltinScheduler createBuiltinScheduler(boolean wrapped) {
         int parallelism, maxPoolSize, minRunnable;
         String parallelismValue = System.getProperty("jdk.virtualThreadScheduler.parallelism");
         String maxPoolSizeValue = System.getProperty("jdk.virtualThreadScheduler.maxPoolSize");
@@ -1484,6 +1494,10 @@ final class VirtualThread extends BaseVirtualThread {
             minRunnable = Integer.parseInt(minRunnableValue);
         } else {
             minRunnable = Integer.max(parallelism / 2, 1);
+        }
+        if (Boolean.getBoolean("jdk.virtualThreadScheduler.useMpsc")) {
+            System.err.println("WARNING: Using experimental MPSC virtual thread scheduler");
+            return new MpscVirtualThreadScheduler(parallelism);
         }
         ForkJoinWorkerThreadFactory factory;
         if (wrapped) {
@@ -1506,10 +1520,23 @@ final class VirtualThread extends BaseVirtualThread {
     }
 
     /**
+     * A built-in scheduler. Besides the scheduler callbacks, it creates the task of each
+     * virtual thread it schedules, so that it can keep per-thread state there.
+     */
+    interface BuiltinScheduler extends VirtualThreadScheduler {
+        /**
+         * Creates the task of a new virtual thread scheduled by this scheduler.
+         */
+        default VThreadTask newTask(VirtualThread vthread) {
+            return new VThreadTask(vthread);
+        }
+    }
+
+    /**
      * The built-in ForkJoinPool scheduler.
      */
     private static class BuiltinForkJoinPoolScheduler
-            extends ForkJoinPool implements VirtualThreadScheduler {
+            extends ForkJoinPool implements BuiltinScheduler {
 
         BuiltinForkJoinPoolScheduler(int parallelism,
                                      int maxPoolSize,

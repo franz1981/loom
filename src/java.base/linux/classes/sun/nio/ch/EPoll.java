@@ -68,6 +68,7 @@ class EPoll {
 
     // flags
     static final int EPOLLONESHOT   = (1 << 30);
+    static final int EPOLLET        = (1 << 31);
 
     /**
      * Allocates a poll array to handle up to {@code count} events.

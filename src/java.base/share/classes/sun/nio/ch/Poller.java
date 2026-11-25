@@ -92,7 +92,39 @@ public abstract class Poller {
          * for I/O. If there are no events then the poller threads park until there
          * are I/O events to poll. The write poller is a system-wide platform thread.
          */
-        POLLER_PER_CARRIER
+        POLLER_PER_CARRIER,
+
+        /**
+         * Each carrier thread owns a {@link LocalPoller}, which virtual threads
+         * mounted on it register with to read; the carrier blocks in it when idle.
+         * No master poller or sub-pollers. Write pollers, and read pollers for virtual
+         * threads on carriers without a local poller, are system-wide platform threads.
+         * The default when {@link LocalPollers#enabled()} and the built-in scheduler is
+         * a {@link LocalPoller.Scheduler}; otherwise jdk.pollerMode=4 falls back, with a
+         * warning, to the platform's default mode.
+         */
+        CARRIER_LOCAL_POLLER
+    }
+
+    /**
+     * Whether Mode 4 can be used: local pollers are enabled and the built-in scheduler's
+     * carriers own them.
+     */
+    private static boolean carrierLocalPollersSupported() {
+        // enabled() first: without continuations or local pollers on this platform,
+        // the built-in scheduler is not initialized here
+        return LocalPollers.enabled()
+                && JLA.builtinVirtualThreadScheduler() instanceof LocalPoller.Scheduler;
+    }
+
+    /**
+     * Whether Mode 3 can be used: not with a built-in scheduler whose carriers can own
+     * local pollers (MPSC), which ignores the preferred carrier of Mode 3's read pollers.
+     */
+    private static boolean pollerPerCarrierSupported() {
+        // continuations first: without them, the built-in scheduler is not initialized here
+        return !ContinuationSupport.isSupported()
+                || !(JLA.builtinVirtualThreadScheduler() instanceof LocalPoller.Scheduler);
     }
 
     /**
@@ -100,27 +132,47 @@ public abstract class Poller {
      */
     private static PollerGroup createPollerGroup() {
         try {
-            PollerProvider provider;
+            // the requested mode, or null for the platform's default
+            Mode mode = null;
             if (System.getProperty("jdk.pollerMode") instanceof String s) {
-                Mode mode = switch (s) {
+                mode = switch (s) {
                     case "1" -> Mode.SYSTEM_THREADS;
                     case "2" -> Mode.VTHREAD_POLLERS;
-                    case "3" -> Mode.POLLER_PER_CARRIER;
+                    case "3" -> {
+                        if (pollerPerCarrierSupported()) {
+                            yield Mode.POLLER_PER_CARRIER;
+                        }
+                        System.err.println("WARNING: jdk.pollerMode=3 is not supported by "
+                                + "the MPSC scheduler; using the platform's default poller mode");
+                        yield null;
+                    }
+                    case "4" -> {
+                        if (carrierLocalPollersSupported()) {
+                            yield Mode.CARRIER_LOCAL_POLLER;
+                        }
+                        System.err.println("WARNING: jdk.pollerMode=4 requires continuations, "
+                                + "a platform with carrier-local pollers and the MPSC scheduler; "
+                                + "using the platform's default poller mode");
+                        yield null;
+                    }
                     default -> {
                         throw new RuntimeException(s + " is not a valid polling mode");
                     }
                 };
-                provider = PollerProvider.createProvider(mode);
-            } else {
-                provider = PollerProvider.createProvider();
+            } else if (carrierLocalPollersSupported()) {
+                mode = Mode.CARRIER_LOCAL_POLLER;
             }
+            PollerProvider provider = (mode != null)
+                    ? PollerProvider.createProvider(mode)
+                    : PollerProvider.createProvider();
 
             int readPollers = pollerCount("jdk.readPollers", provider.defaultReadPollers());
             int writePollers = pollerCount("jdk.writePollers", provider.defaultWritePollers());
             PollerGroup group = switch (provider.pollerMode()) {
-                case SYSTEM_THREADS     -> new SystemThreadsPollerGroup(provider, readPollers, writePollers);
-                case VTHREAD_POLLERS    -> new VThreadsPollerGroup(provider, readPollers, writePollers);
-                case POLLER_PER_CARRIER -> new PollerPerCarrierPollerGroup(provider, writePollers);
+                case SYSTEM_THREADS        -> new SystemThreadsPollerGroup(provider, readPollers, writePollers);
+                case VTHREAD_POLLERS       -> new VThreadsPollerGroup(provider, readPollers, writePollers);
+                case POLLER_PER_CARRIER    -> new PollerPerCarrierPollerGroup(provider, writePollers);
+                case CARRIER_LOCAL_POLLER  -> new CarrierLocalPollerGroup(provider, readPollers, writePollers);
             };
             group.start();
             return group;
@@ -809,5 +861,116 @@ public abstract class Poller {
      */
     public static List<Poller> writePollers() {
         return POLLER_GROUP.writePollers();
+    }
+
+    /**
+     * The poller group for {@link Mode#CARRIER_LOCAL_POLLER}.
+     */
+    private static class CarrierLocalPollerGroup extends PollerGroup {
+        // system-wide, in platform threads; the read pollers serve threads with no
+        // carrier-local poller, e.g. under a custom scheduler wrapping the built-in one
+        private final Poller[] readPollers;
+        private final Poller[] writePollers;
+
+        CarrierLocalPollerGroup(PollerProvider provider,
+                                int readPollerCount,
+                                int writePollerCount) throws IOException {
+            super(provider);
+            Poller[] readPollers = new Poller[readPollerCount];
+            Poller[] writePollers = new Poller[writePollerCount];
+            try {
+                for (int i = 0; i < readPollerCount; i++) {
+                    readPollers[i] = provider.readPoller(false);
+                }
+                for (int i = 0; i < writePollerCount; i++) {
+                    writePollers[i] = provider.writePoller(false);
+                }
+            } catch (Throwable e) {
+                PollerGroup.closeAll(readPollers);
+                PollerGroup.closeAll(writePollers);
+                throw e;
+            }
+            this.readPollers = readPollers;
+            this.writePollers = writePollers;
+        }
+
+        @Override
+        void start() {
+            Arrays.stream(readPollers).forEach(p -> {
+                startPlatformThread("Read-Poller", p::pollerLoop);
+            });
+            Arrays.stream(writePollers).forEach(p -> {
+                startPlatformThread("Write-Poller", p::pollerLoop);
+            });
+        }
+
+        private Poller readPoller(int fdVal) {
+            int index = provider().fdValToIndex(fdVal, readPollers.length);
+            return readPollers[index];
+        }
+
+        private Poller writePoller(int fdVal) {
+            int index = provider().fdValToIndex(fdVal, writePollers.length);
+            return writePollers[index];
+        }
+
+        private LocalPoller getLocalPoller() {
+            return (JLA.currentCarrierThread() instanceof LocalPoller.Carrier c)
+                    ? c.localPoller()
+                    : null;
+        }
+
+        @Override
+        void poll(int fdVal, int event, long nanos, BooleanSupplier isOpen) throws IOException {
+            if (event == Net.POLLIN && Thread.currentThread().isVirtual()) {
+                // pinned: only a poller's own carrier may register with it
+                LocalPoller poller;
+                Continuation.pin();
+                try {
+                    poller = getLocalPoller();
+                    if (poller != null) {
+                        poller.register(fdVal, event, Thread.currentThread());
+                    }
+                } finally {
+                    Continuation.unpin();
+                }
+                if (poller != null) {
+                    try {
+                        if (isOpen.getAsBoolean()) {
+                            if (nanos > 0) {
+                                LockSupport.parkNanos(nanos);
+                            } else {
+                                LockSupport.park();
+                            }
+                        }
+                    } finally {
+                        poller.deregister(fdVal, Thread.currentThread());
+                    }
+                    return;
+                }
+            }
+
+            // POLLOUT, or a thread with no carrier-local poller: system-wide pollers
+            if (event == Net.POLLIN) {
+                readPoller(fdVal).poll(fdVal, nanos, isOpen);
+            } else {
+                writePoller(fdVal).poll(fdVal, nanos, isOpen);
+            }
+        }
+
+        @Override
+        Poller masterPoller() {
+            return null;
+        }
+
+        @Override
+        List<Poller> readPollers() {
+            return List.of(readPollers);
+        }
+
+        @Override
+        List<Poller> writePollers() {
+            return List.of(writePollers);
+        }
     }
 }

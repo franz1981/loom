@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,6 +31,7 @@ import jdk.management.VirtualThreadSchedulerMXBean;
 import jdk.internal.access.JavaLangAccess;
 import jdk.internal.access.SharedSecrets;
 import jdk.internal.vm.ContinuationSupport;
+import jdk.internal.vm.VirtualThreadSchedulerStatistics;
 import sun.management.Util;
 
 /**
@@ -113,6 +114,7 @@ public class VirtualThreadSchedulerImpls {
             return switch (builtinScheduler()) {
                 case ForkJoinPool pool -> pool.getParallelism();
                 case ThreadPoolExecutor pool -> pool.getMaximumPoolSize();
+                case VirtualThreadSchedulerStatistics s -> s.getParallelism();
                 default -> -1;
             };
         }
@@ -131,6 +133,7 @@ public class VirtualThreadSchedulerImpls {
             return switch (builtinScheduler()) {
                 case ForkJoinPool pool -> pool.getPoolSize();
                 case ThreadPoolExecutor pool -> pool.getPoolSize();
+                case VirtualThreadSchedulerStatistics s -> s.getPoolSize();
                 default -> -1;
             };
         }
@@ -140,6 +143,7 @@ public class VirtualThreadSchedulerImpls {
             return switch (builtinScheduler()) {
                 case ForkJoinPool pool -> pool.getActiveThreadCount();
                 case ThreadPoolExecutor pool -> pool.getActiveCount();
+                case VirtualThreadSchedulerStatistics s -> s.getMountedVirtualThreadCount();
                 default -> -1;
             };
         }
@@ -149,6 +153,7 @@ public class VirtualThreadSchedulerImpls {
             return switch (builtinScheduler()) {
                 case ForkJoinPool pool -> pool.getQueuedTaskCount() + pool.getQueuedSubmissionCount();
                 case ThreadPoolExecutor pool -> pool.getQueue().size();
+                case VirtualThreadSchedulerStatistics s -> s.getQueuedVirtualThreadCount();
                 default -> -1L;
             };
         }
