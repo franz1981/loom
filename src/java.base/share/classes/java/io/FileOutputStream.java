@@ -28,6 +28,7 @@ package java.io;
 import java.nio.channels.FileChannel;
 import jdk.internal.access.SharedSecrets;
 import jdk.internal.access.JavaIOFileDescriptorAccess;
+import jdk.internal.access.JavaIOFileOutputStreamAccess;
 import jdk.internal.event.FileWriteEvent;
 import sun.nio.ch.FileChannelImpl;
 
@@ -461,5 +462,21 @@ public class FileOutputStream extends OutputStream
 
     static {
         initIDs();
+        SharedSecrets.setJavaIOFileOutputStreamAccess(new JavaIOFileOutputStreamAccess() {
+            @Override
+            public boolean traced() {
+                return jfrTracing && FileWriteEvent.enabled();
+            }
+
+            @Override
+            public void writeUntraced(FileOutputStream out, byte[] b, int off, int len) throws IOException {
+                out.writeBytes(b, off, len, FD_ACCESS.getAppend(out.fd));
+            }
+
+            @Override
+            public void writeUntraced(FileOutputStream out, int b) throws IOException {
+                out.write(b, FD_ACCESS.getAppend(out.fd));
+            }
+        });
     }
 }

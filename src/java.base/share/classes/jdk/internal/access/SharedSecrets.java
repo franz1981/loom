@@ -40,6 +40,7 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.jar.JarFile;
 import java.io.Console;
 import java.io.FileDescriptor;
+import java.io.FileOutputStream;
 import java.io.FilePermission;
 import java.io.ObjectInputStream;
 import java.io.RandomAccessFile;
@@ -84,6 +85,7 @@ public class SharedSecrets {
     @Stable private static JavaLangReflectAccess javaLangReflectAccess;
     @Stable private static JavaIOAccess javaIOAccess;
     @Stable private static JavaIOFileDescriptorAccess javaIOFileDescriptorAccess;
+    @Stable private static JavaIOFileOutputStreamAccess javaIOFileOutputStreamAccess;
     @Stable private static JavaIORandomAccessFileAccess javaIORandomAccessFileAccess;
     @Stable private static JavaObjectInputStreamReadString javaObjectInputStreamReadString;
     @Stable private static JavaObjectInputStreamAccess javaObjectInputStreamAccess;
@@ -306,6 +308,19 @@ public class SharedSecrets {
         if (access == null) {
             ensureClassInitialized(FileDescriptor.class);
             access = javaIOFileDescriptorAccess;
+        }
+        return access;
+    }
+
+    public static void setJavaIOFileOutputStreamAccess(JavaIOFileOutputStreamAccess jiofosa) {
+        javaIOFileOutputStreamAccess = jiofosa;
+    }
+
+    public static JavaIOFileOutputStreamAccess getJavaIOFileOutputStreamAccess() {
+        var access = javaIOFileOutputStreamAccess;
+        if (access == null) {
+            ensureClassInitialized(FileOutputStream.class);
+            access = javaIOFileOutputStreamAccess;
         }
         return access;
     }

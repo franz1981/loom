@@ -61,6 +61,18 @@ public final class FileDescriptor {
      */
     private boolean append;
 
+    /**
+     * Whether the file is a regular file on a local filesystem: FS_UNKNOWN until the
+     * first fsClassify, then FS_LOCAL or FS_OTHER for good. Racy: every thread that
+     * reads it from the fd stores the same value. The standard streams' value can be
+     * stale after a native dup2 onto fds 0-2, or after close redirects them to
+     * /dev/null; that changes only whether a synchronous operation on them is a section.
+     */
+    private byte fsKind;
+    private static final int FS_UNKNOWN = JavaIOFileDescriptorAccess.FS_UNKNOWN;
+    private static final int FS_LOCAL = JavaIOFileDescriptorAccess.FS_LOCAL;
+    private static final int FS_OTHER = JavaIOFileDescriptorAccess.FS_OTHER;
+
     static {
         initIDs();
     }
@@ -110,6 +122,14 @@ public final class FileDescriptor {
 
                     public long getHandle(FileDescriptor fdo) {
                         return fdo.handle;
+                    }
+
+                    public int fsKind(FileDescriptor fdo) {
+                        return fdo.fsKind;
+                    }
+
+                    public int fsClassify(FileDescriptor fdo) {
+                        return fdo.fsClassify();
                     }
                 }
         );
@@ -207,7 +227,7 @@ public final class FileDescriptor {
      * @since     1.1
      */
     public void sync() throws SyncFailedException {
-        boolean attempted = Blocker.begin();
+        boolean attempted = Blocker.beginDiskIO(this, true);
         try {
             sync0();
         } finally {
@@ -230,6 +250,27 @@ public final class FileDescriptor {
      * Returns true, if the file was opened for appending.
      */
     private static native boolean getAppend(int fd);
+
+    /**
+     * FS_LOCAL if the file is a regular file on a local filesystem: one whose transfers
+     * and flushes complete in this host's block layer or memory, with no request to a
+     * server, a user-space daemon or a process at the other end; else FS_OTHER. Read from
+     * the fd, which may wait on a remote filesystem, and cached. Without a valid fd
+     * (closed, or a Windows file, which has a handle) it is FS_OTHER.
+     */
+    private int fsClassify() {
+        int fd = this.fd;
+        int k = (fd < 0) ? FS_OTHER : fsKind0(fd);
+        fsKind = (byte) k;
+        return k;
+    }
+
+    /**
+     * FS_LOCAL if fd is a regular file on a local filesystem, else FS_OTHER: any other
+     * file type, a network or FUSE filesystem, one not known to be local, a platform
+     * where it is not checked, or a failed read.
+     */
+    private static native int fsKind0(int fd);
 
     /**
      * Set the fd.

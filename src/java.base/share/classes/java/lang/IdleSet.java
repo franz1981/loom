@@ -28,21 +28,22 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 
 /**
- * One idle bit per carrier, with stealing, written only by that carrier: set when it
- * parks, cleared when it leaves PARKED. A bit is a hint; the carrier's state is the
- * truth.
+ * One idle bit per thread of a set, written only by that thread: per carrier with
+ * stealing, set when it parks and cleared when it leaves PARKED; per offload pool
+ * worker, set when it becomes IDLE and cleared when it takes a task or exits. A bit is
+ * a hint; the thread's state is the truth.
  */
 final class IdleSet {
     private static final VarHandle IDLE_WORD = MethodHandles.arrayElementVarHandle(long[].class);
 
-    // Carrier i's bit is bit i & 63 of word i >>> 6. Words are 128 bytes apart, with
+    // Thread i's bit is bit i & 63 of word i >>> 6. Words are 128 bytes apart, with
     // padding before the first and after the last, so no two share a cache line.
     private static final int IDLE_STRIDE = 16;
     private final long[] idleWords;
     private final int idleWordCount;
 
-    IdleSet(int carrierCount) {
-        this.idleWordCount = (carrierCount + 63) >>> 6;
+    IdleSet(int size) {
+        this.idleWordCount = (size + 63) >>> 6;
         this.idleWords = new long[(idleWordCount + 2) * IDLE_STRIDE];
     }
 
@@ -68,11 +69,20 @@ final class IdleSet {
         return (w + 1) * IDLE_STRIDE;
     }
 
-    void setIdle(MpscCarrierThread c) {
-        IDLE_WORD.getAndBitwiseOr(idleWords, idleIndex(c.id >>> 6), 1L << c.id);
+    /** The number of bits set, a racy snapshot. */
+    int count() {
+        int n = 0;
+        for (int w = 0; w < idleWordCount; w++) {
+            n += Long.bitCount(word(w));
+        }
+        return n;
     }
 
-    void clearIdle(MpscCarrierThread c) {
-        IDLE_WORD.getAndBitwiseAnd(idleWords, idleIndex(c.id >>> 6), ~(1L << c.id));
+    void setIdle(int i) {
+        IDLE_WORD.getAndBitwiseOr(idleWords, idleIndex(i >>> 6), 1L << i);
+    }
+
+    void clearIdle(int i) {
+        IDLE_WORD.getAndBitwiseAnd(idleWords, idleIndex(i >>> 6), ~(1L << i));
     }
 }

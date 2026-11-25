@@ -108,25 +108,33 @@ class PollSelectorImpl extends SelectorImpl {
         try {
             begin(blocking);
 
-            int numPolled;
-            do {
-                long startTime = timedPoll ? System.nanoTime() : 0;
-                boolean attempted = Blocker.begin(blocking);
-                try {
-                    numPolled = poll(pollArray.address(), pollArraySize, to);
-                } finally {
-                    Blocker.end(attempted);
-                }
-                if (numPolled == IOStatus.INTERRUPTED && timedPoll) {
-                    // timed poll interrupted so need to adjust timeout
-                    long adjust = System.nanoTime() - startTime;
-                    to -= (int) TimeUnit.NANOSECONDS.toMillis(adjust);
-                    if (to <= 0) {
-                        // timeout expired so no retry
-                        numPolled = 0;
+            // on a BlockingCarrier, poll without a timeout first; the waiting poll is a
+            // section only if nothing is ready
+            int numPolled = 0;
+            boolean probed = blocking && Blocker.tryNonBlockingFirst();
+            if (probed) {
+                numPolled = poll(pollArray.address(), pollArraySize, 0);
+            }
+            if (!probed || numPolled == 0 || numPolled == IOStatus.INTERRUPTED) {
+                do {
+                    long startTime = timedPoll ? System.nanoTime() : 0;
+                    boolean attempted = Blocker.begin(blocking);
+                    try {
+                        numPolled = poll(pollArray.address(), pollArraySize, to);
+                    } finally {
+                        Blocker.end(attempted);
                     }
-                }
-            } while (numPolled == IOStatus.INTERRUPTED);
+                    if (numPolled == IOStatus.INTERRUPTED && timedPoll) {
+                        // timed poll interrupted so need to adjust timeout
+                        long adjust = System.nanoTime() - startTime;
+                        to -= (int) TimeUnit.NANOSECONDS.toMillis(adjust);
+                        if (to <= 0) {
+                            // timeout expired so no retry
+                            numPolled = 0;
+                        }
+                    }
+                } while (numPolled == IOStatus.INTERRUPTED);
+            }
             assert numPolled <= pollArraySize;
 
         } finally {

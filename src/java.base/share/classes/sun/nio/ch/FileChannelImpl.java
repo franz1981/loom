@@ -250,7 +250,7 @@ public class FileChannelImpl
                 if (!isOpen())
                     return 0;
                 do {
-                    boolean attempted = Blocker.begin(direct);
+                    boolean attempted = Blocker.beginDiskIO(fd, direct);
                     try {
                         n = IOUtil.read(fd, dst, -1, direct, alignment, nd);
                     } finally {
@@ -303,7 +303,7 @@ public class FileChannelImpl
                 if (!isOpen())
                     return 0;
                 do {
-                    boolean attempted = Blocker.begin(direct);
+                    boolean attempted = Blocker.beginDiskIO(fd, direct);
                     try {
                         n = IOUtil.read(fd, dsts, offset, length, direct, alignment, nd);
                     } finally {
@@ -354,7 +354,7 @@ public class FileChannelImpl
                 if (!isOpen())
                     return 0;
                 do {
-                    boolean attempted = Blocker.begin(sync || direct);
+                    boolean attempted = Blocker.beginDiskIO(fd, sync || direct);
                     try {
                         n = IOUtil.write(fd, src, -1, direct, alignment, nd);
                     } finally {
@@ -406,7 +406,7 @@ public class FileChannelImpl
                 if (!isOpen())
                     return 0;
                 do {
-                    boolean attempted = Blocker.begin(sync || direct);
+                    boolean attempted = Blocker.beginDiskIO(fd, sync || direct);
                     try {
                         n = IOUtil.write(fd, srcs, offset, length, direct, alignment, nd);
                     } finally {
@@ -619,7 +619,7 @@ public class FileChannelImpl
             if (!isOpen())
                 return;
             do {
-                boolean attempted = Blocker.begin();
+                boolean attempted = Blocker.beginDiskIO(fd, true);
                 try {
                     rv = nd.force(fd, metaData);
                 } finally {
@@ -1197,7 +1197,7 @@ public class FileChannelImpl
             if (!isOpen())
                 return -1;
             do {
-                boolean attempted = Blocker.begin(direct);
+                boolean attempted = Blocker.beginDiskIO(fd, direct);
                 try {
                     n = IOUtil.read(fd, dst, position, direct, alignment, nd);
                 } finally {
@@ -1260,7 +1260,7 @@ public class FileChannelImpl
             if (!isOpen())
                 return -1;
             do {
-                boolean attempted = Blocker.begin(sync || direct);
+                boolean attempted = Blocker.beginDiskIO(fd, sync || direct);
                 try {
                     n = IOUtil.write(fd, src, position, direct, alignment, nd);
                 } finally {
@@ -1690,15 +1690,21 @@ public class FileChannelImpl
             ti = threads.add();
             if (!isOpen())
                 return null;
-            int n;
-            do {
-                boolean attempted = Blocker.begin();
-                try {
-                    n = nd.lock(fd, true, position, size, shared);
-                } finally {
-                    Blocker.end(attempted);
-                }
-            } while ((n == FileDispatcher.INTERRUPTED) && isOpen());
+            int n = FileDispatcher.NO_LOCK;
+            // on a BlockingCarrier, a free lock is taken without a section
+            if (Blocker.tryNonBlockingFirst()) {
+                n = nd.lock(fd, false, position, size, shared);
+            }
+            if (n != FileDispatcher.LOCKED && n != FileDispatcher.RET_EX_LOCK) {
+                do {
+                    boolean attempted = Blocker.begin();
+                    try {
+                        n = nd.lock(fd, true, position, size, shared);
+                    } finally {
+                        Blocker.end(attempted);
+                    }
+                } while ((n == FileDispatcher.INTERRUPTED) && isOpen());
+            }
             if (isOpen()) {
                 if (n == FileDispatcher.RET_EX_LOCK) {
                     assert shared;

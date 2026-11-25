@@ -26,6 +26,7 @@
 package java.lang;
 
 import jdk.internal.misc.Blocker;
+import jdk.internal.misc.NoWaitWrite;
 import jdk.internal.util.StaticProperty;
 
 import java.io.*;
@@ -1062,9 +1063,38 @@ public abstract class Process implements Closeable {
      * instead of seeking, the underlying pipe does not support seek.
      */
     static class PipeInputStream extends FileInputStream {
+        private final PipeWait pipeWait = new PipeWait(this::closeFd);
 
         PipeInputStream(FileDescriptor fd) {
             super(fd);
+        }
+
+        private boolean readsNow() throws IOException {
+            return Blocker.tryNonBlockingFirst() && sun.nio.ch.StreamProbe.readable(getFD());
+        }
+
+        /** Waits for bytes or the end on the carrier's poller, then reads (PipeWait). */
+        private int readWaiting(byte[] b, int off, int len) throws IOException {
+            Objects.checkFromIndexSize(off, len, b.length);
+            if (len == 0) {
+                return 0;
+            }
+            FileDescriptor fd = getFD();
+            while (!sun.nio.ch.StreamProbe.readable(fd)) {
+                pipeWait.await(fd, sun.nio.ch.Net.POLLIN);
+            }
+            return super.read(b, off, len);
+        }
+
+        private void closeFd() throws IOException {
+            super.close();
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (pipeWait.close()) {
+                super.close();
+            }
         }
 
         @Override
@@ -1089,8 +1119,16 @@ public abstract class Process implements Closeable {
             return n - remaining;
         }
 
+        // the Buffered wrapper reads only through read(byte[], int, int): this one does
+        // not wait on the poller
         @Override
         public int read() throws IOException {
+            if (pipeWait.closing()) {
+                throw new IOException("Stream Closed");
+            }
+            if (readsNow()) {
+                return super.read();
+            }
             boolean attempted = Blocker.begin();
             try {
                 return super.read();
@@ -1101,16 +1139,24 @@ public abstract class Process implements Closeable {
 
         @Override
         public int read(byte[] b) throws IOException {
-            boolean attempted = Blocker.begin();
-            try {
-                return super.read(b);
-            } finally {
-                Blocker.end(attempted);
-            }
+            return read(b, 0, b.length);
         }
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
+            if (pipeWait.closing()) {
+                throw new IOException("Stream Closed");
+            }
+            if (PipeWait.canWait() && pipeWait.enter()) {
+                try {
+                    return readWaiting(b, off, len);
+                } finally {
+                    pipeWait.exit();
+                }
+            }
+            if (readsNow()) {
+                return super.read(b, off, len);
+            }
             boolean attempted = Blocker.begin();
             try {
                 return super.read(b, off, len);
@@ -1124,12 +1170,75 @@ public abstract class Process implements Closeable {
      * An output stream for a subprocess pipe.
      */
     static class PipeOutputStream extends FileOutputStream {
+        private final NoWaitWrite noWait;
+        private final PipeWait pipeWait = new PipeWait(this::closeFd);
+
         PipeOutputStream(FileDescriptor fd) {
             super(fd);
+            noWait = new NoWaitWrite(fd, false);
+        }
+
+        /**
+         * Writes b[off, off + len) with no-wait attempts, waiting for room on a poller
+         * between them (PipeWait). If the kernel stops taking attempts, the rest is
+         * written as on the stream's other path.
+         */
+        private void writeWaiting(byte[] b, int off, int len) throws IOException {
+            FileDescriptor fd = getFD();
+            int done = 0;
+            while (done < len) {
+                int n = noWait.write(b, off + done, len - done);
+                if (n == NoWaitWrite.PLAIN) {
+                    super.write(b, off + done, len - done);
+                    return;
+                }
+                if (!noWait.attempts()) {
+                    done += n;
+                    boolean attempted = Blocker.begin();
+                    try {
+                        super.write(b, off + done, len - done);
+                    } finally {
+                        Blocker.end(attempted);
+                    }
+                    return;
+                }
+                done += n;
+                if (done < len) {
+                    pipeWait.await(fd, sun.nio.ch.Net.POLLOUT);
+                }
+            }
+        }
+
+        private void closeFd() throws IOException {
+            super.close();
         }
 
         @Override
+        public void close() throws IOException {
+            if (pipeWait.close()) {
+                super.close();
+            }
+        }
+
+        // the Buffered wrapper writes only through write(byte[], int, int): this one does
+        // not wait on the poller
+        @Override
         public void write(int b) throws IOException {
+            if (pipeWait.closing()) {
+                throw new IOException("Stream Closed");
+            }
+            if (noWait.recorded()) {
+                noWait.writeRecorded(this, b);
+                return;
+            }
+            int n = noWait.write(b);
+            if (n == NoWaitWrite.PLAIN) {
+                super.write(b);
+                return;
+            }
+            if (n == 1) {
+                return;
+            }
             boolean attempted = Blocker.begin();
             try {
                 super.write(b);
@@ -1140,19 +1249,39 @@ public abstract class Process implements Closeable {
 
         @Override
         public void write(byte[] b) throws IOException {
-            boolean attempted = Blocker.begin();
-            try {
-                super.write(b);
-            } finally {
-                Blocker.end(attempted);
-            }
+            write(b, 0, b.length);
         }
 
         @Override
         public void write(byte[] b, int off, int len) throws IOException {
+            if (pipeWait.closing()) {
+                throw new IOException("Stream Closed");
+            }
+            if (b != null && len > 0 && !noWait.recorded() && noWait.attempts()
+                    && PipeWait.canWait() && pipeWait.enter()) {
+                try {
+                    Objects.checkFromIndexSize(off, len, b.length);
+                    writeWaiting(b, off, len);
+                    return;
+                } finally {
+                    pipeWait.exit();
+                }
+            }
+            if (noWait.recorded()) {
+                noWait.writeRecorded(this, b, off, len);
+                return;
+            }
+            int n = noWait.write(b, off, len);
+            if (n == NoWaitWrite.PLAIN) {
+                super.write(b, off, len);
+                return;
+            }
+            if (n == len && len > 0) {
+                return;
+            }
             boolean attempted = Blocker.begin();
             try {
-                super.write(b, off, len);
+                super.write(b, off + n, len - n);
             } finally {
                 Blocker.end(attempted);
             }

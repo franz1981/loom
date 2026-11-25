@@ -935,22 +935,24 @@ public abstract class Poller {
                     Continuation.unpin();
                 }
                 if (poller != null) {
+                    boolean parked = true;
                     try {
                         if (isOpen.getAsBoolean()) {
-                            if (nanos > 0) {
-                                LockSupport.parkNanos(nanos);
-                            } else {
-                                LockSupport.park();
-                            }
+                            parked = JLA.tryParkVirtualThread(nanos);
                         }
                     } finally {
                         poller.deregister(fdVal, Thread.currentThread());
                     }
-                    return;
+                    if (parked) {
+                        return;
+                    }
+                    // pinned: parking would block the only thread that polls this
+                    // registration; the system-wide poller below fires at once if ready
                 }
             }
 
-            // POLLOUT, or a thread with no carrier-local poller: system-wide pollers
+            // POLLOUT, a thread with no carrier-local poller, or a pinned caller:
+            // system-wide pollers
             if (event == Net.POLLIN) {
                 readPoller(fdVal).poll(fdVal, nanos, isOpen);
             } else {

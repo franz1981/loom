@@ -78,6 +78,12 @@ Java_java_io_FileDescriptor_getAppend(JNIEnv *env, jclass fdClass, jint fd) {
     return JNI_FALSE;
 }
 
+// not checked on Windows: every file is other
+JNIEXPORT jint JNICALL
+Java_java_io_FileDescriptor_fsKind0(JNIEnv *env, jclass fdClass, jint fd) {
+    return java_io_FileDescriptor_FS_OTHER;
+}
+
 // instance method close0 for FileDescriptor
 JNIEXPORT void JNICALL
 Java_java_io_FileDescriptor_close0(JNIEnv *env, jobject this) {

@@ -28,7 +28,10 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import jdk.test.lib.Utils;
@@ -48,6 +51,24 @@ final class MpscTestSupport {
 
     /** A hang guard: how long a wait for something that must happen may last. */
     static final long DEADLINE_MS = Utils.adjustTimeout(10_000);
+
+    /** Whether the built-in scheduler is the MPSC one. */
+    static final boolean MPSC = Boolean.getBoolean("jdk.virtualThreadScheduler.useMpsc");
+
+    static final int PARALLELISM = Integer.getInteger("jdk.virtualThreadScheduler.parallelism",
+            Runtime.getRuntime().availableProcessors());
+
+    /** The offload pool's bound: maxPoolSize - parallelism. */
+    static final int POOL_CAP = Integer.getInteger("jdk.virtualThreadScheduler.maxPoolSize",
+            Math.max(PARALLELISM, 256)) - PARALLELISM;
+
+    /** How long an idle offload pool thread lives. */
+    static final long KEEP_ALIVE_MS =
+            Long.getLong("jdk.virtualThreadScheduler.mpscOffloadKeepAliveMillis", 30_000L);
+
+    /** Name prefixes: the scheduler's carriers and its offload pool threads. */
+    static final String CARRIER = "mpsc-carrier-";
+    static final String POOL_THREAD = "mpsc-helper-";
 
     /** Fails unless the scheduler's own asserts are enabled (-esa). */
     static void assertSchedulerAssertionsEnabled() throws ClassNotFoundException {
@@ -70,6 +91,89 @@ final class MpscTestSupport {
             }
             Thread.sleep(1);
         }
+    }
+
+    /**
+     * Waits until the thread is parked, or until its stack shows a frame whose text
+     * contains one of the given names (a call blocked in a system call shows RUNNABLE);
+     * fails at the deadline.
+     */
+    static void awaitParkedOrIn(Thread thread, String... frames) throws InterruptedException {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEADLINE_MS);
+        for (;;) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+                return;
+            }
+            for (StackTraceElement f : thread.getStackTrace()) {
+                for (String frame : frames) {
+                    if (f.toString().contains(frame)) {
+                        return;
+                    }
+                }
+            }
+            if (state == Thread.State.TERMINATED || System.nanoTime() - end > 0) {
+                throw new AssertionError(thread + " neither parked nor reached " + List.of(frames)
+                        + ": " + state + " " + List.of(thread.getStackTrace()));
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    /** Fails unless a new virtual thread runs within the deadline. */
+    static void assertRunsNow(String what) throws InterruptedException {
+        CountDownLatch ran = new CountDownLatch(1);
+        Thread.ofVirtual().start(ran::countDown);
+        if (!ran.await(DEADLINE_MS, TimeUnit.MILLISECONDS)) {
+            throw new AssertionError(what + ": a new thread did not run");
+        }
+    }
+
+    /** The name of the current virtual thread's carrier, from its toString. */
+    static String carrierName() {
+        String s = Thread.currentThread().toString();
+        return s.substring(s.lastIndexOf('@') + 1);
+    }
+
+    /** The offload pool threads alive now. */
+    static List<Thread> poolThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.getName().startsWith(POOL_THREAD))
+                .toList();
+    }
+
+    /** Waits until every pool thread has exited after the keep-alive. */
+    static void awaitNoPoolThreads() throws InterruptedException {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(KEEP_ALIVE_MS * 3 + DEADLINE_MS);
+        while (!poolThreads().isEmpty()) {
+            if (System.nanoTime() - end > 0) {
+                throw new AssertionError("pool threads did not exit: " + poolThreads());
+            }
+            Thread.sleep(20);
+        }
+    }
+
+    /** Waits until every pool thread is parked; false at the deadline. */
+    static boolean awaitPoolThreadsParked() throws InterruptedException {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEADLINE_MS);
+        while (System.nanoTime() - end < 0) {
+            if (poolThreads().stream().allMatch(t -> t.getState() == Thread.State.WAITING
+                    || t.getState() == Thread.State.TIMED_WAITING)) {
+                return true;
+            }
+            Thread.sleep(5);
+        }
+        return false;
+    }
+
+    /** A new FIFO in a new directory under the current one. */
+    static Path mkfifo() throws IOException, InterruptedException {
+        Path fifo = Files.createTempDirectory(Path.of("."), "fifo").resolve("fifo");
+        int rc = new ProcessBuilder("mkfifo", fifo.toString()).inheritIO().start().waitFor();
+        if (rc != 0) {
+            throw new IOException("mkfifo " + rc);
+        }
+        return fifo;
     }
 
     /**

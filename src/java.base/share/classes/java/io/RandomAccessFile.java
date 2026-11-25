@@ -559,7 +559,7 @@ public class RandomAccessFile implements DataOutput, DataInput, Closeable {
     }
 
     private void implWrite(int b) throws IOException {
-        boolean attempted = Blocker.begin(sync);
+        boolean attempted = Blocker.beginDiskIO(fd, sync);
         try {
             write0(b);
         } finally {
@@ -597,7 +597,7 @@ public class RandomAccessFile implements DataOutput, DataInput, Closeable {
     }
 
     private void implWriteBytes(byte[] b, int off, int len) throws IOException {
-        boolean attempted = Blocker.begin(sync);
+        boolean attempted = Blocker.beginDiskIO(fd, sync);
         try {
             writeBytes0(b, off, len);
         } finally {

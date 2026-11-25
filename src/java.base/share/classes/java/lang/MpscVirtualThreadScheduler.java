@@ -50,6 +50,11 @@ import sun.nio.ch.LocalPollers;
  * fds register with directly. Mode 3 is not supported: jdk.pollerMode=3 falls back,
  * with a warning, to the platform's default poller mode.
  *
+ * <p>A thread in a Blocker section runs it on an offload pool thread
+ * ({@link MpscCarrierThread#beginBlocking}, {@link MpscOffloadPool}) unless it is pinned
+ * or the pool has no thread to give, and yields home when the section ends. Disk I/O on
+ * a regular file on a local filesystem (Blocker.beginDiskIO) runs on the carrier.
+ *
  * <p>The carrier states, polling and announcing are in {@link MpscCarrierThread}, the
  * searcher token in {@link SearchGate}.
  */
@@ -70,8 +75,13 @@ final class MpscVirtualThreadScheduler
     private static final AtomicInteger PROBE_SEEDER = new AtomicInteger();
 
     private final MpscCarrierThread[] carriers;
+    private final MpscOffloadPool offloadPool;
 
-    MpscVirtualThreadScheduler(int parallelism) {
+    /**
+     * The offload pool may run up to maxPoolSize - parallelism threads, ForkJoinPool's
+     * bound on the threads it adds for blocked carriers.
+     */
+    MpscVirtualThreadScheduler(int parallelism, int maxPoolSize) {
         if (parallelism < 1) {
             throw new IllegalArgumentException("parallelism must be >= 1");
         }
@@ -81,8 +91,11 @@ final class MpscVirtualThreadScheduler
             this.carriers = new MpscCarrierThread[parallelism];
             IdleSet idleSet = STEAL ? new IdleSet(parallelism) : null;
             SearchGate gate = STEAL ? new SearchGate(carriers, idleSet) : null;
+            ThreadGroup group = carrierThreadGroup();
+            int cap = maxPoolSize - parallelism;
+            this.offloadPool = (cap > 0) ? new MpscOffloadPool(group, cap) : null;
             for (int i = 0; i < parallelism; i++) {
-                carriers[i] = new MpscCarrierThread(i, this, idleSet, gate,
+                carriers[i] = new MpscCarrierThread(group, i, this, idleSet, gate,
                         (pollers != null) ? pollers[i] : null);
             }
             for (; started < parallelism; started++) {
@@ -96,6 +109,18 @@ final class MpscVirtualThreadScheduler
             }
             throw e;
         }
+    }
+
+    /**
+     * A group under the root group, as for ForkJoinPool's CarrierThread, not the group
+     * of the thread that creates the scheduler.
+     */
+    private static ThreadGroup carrierThreadGroup() {
+        ThreadGroup group = Thread.currentThread().getThreadGroup();
+        for (ThreadGroup p; (p = group.getParent()) != null; ) {
+            group = p;
+        }
+        return new ThreadGroup(group, "CarrierThreads");
     }
 
     /** On failure, closes those created and throws: no carrier runs without its poller. */
@@ -125,10 +150,23 @@ final class MpscVirtualThreadScheduler
         }
     }
 
+    /** The offload pool, or null when maxPoolSize leaves no thread for it. */
+    MpscOffloadPool offloadPool() {
+        return offloadPool;
+    }
+
     static final class MpscTask extends VirtualThread.VThreadTask {
         // plain: every write comes before the offer or run of the thread, and onContinue
         // reads it after the thread's next state change, which follows that run
         private MpscCarrierThread home;
+
+        // the offload hint: set by its thread before the yield in beginBlocking, cleared
+        // by onContinue if the thread unmounted, and by beginBlocking after the yield
+        boolean offload;
+
+        // the link in the offload pool's pending stack: written by the pusher before its
+        // CAS, read by the start token's holder after it took the stack
+        MpscTask nextPending;
 
         MpscTask(VirtualThread vthread) {
             super(vthread);
@@ -147,6 +185,11 @@ final class MpscVirtualThreadScheduler
             return t.home;
         }
         return (MpscCarrierThread) ((VirtualThread.CustomVThreadTask) task).builtinState;
+    }
+
+    /** Submits a task to its home, as a section that stays on a carrier. */
+    static void submitHome(VirtualThreadTask task) {
+        home(task).submit(task);
     }
 
     static void setHome(VirtualThreadTask task, MpscCarrierThread home) {
@@ -175,7 +218,21 @@ final class MpscVirtualThreadScheduler
             return;
         }
         boolean yielded = task instanceof VirtualThread.VThreadTask t && t.isYielded();
+        if (yielded && offloadPool != null) {
+            if (task instanceof MpscTask t && t.offload) {
+                // a section begins: hand the thread to a pool thread, else resubmit it
+                // as after any yield
+                t.offload = false;
+                if (offloadPool.execute(t)) {
+                    return;
+                }
+            } else if (Thread.currentThread() instanceof MpscOffloadPool.Worker w) {
+                // a section ends: free the pool thread before the thread is submitted home
+                w.release();
+            }
+        }
         assert !(yielded && task instanceof MpscTask) || Thread.currentThread() == home
+                || !(Thread.currentThread() instanceof MpscCarrierThread)
                 : "YIELDED thread submitted by " + Thread.currentThread();
         // without stealing, nothing would move the thread off a waker's carrier again
         if (STEAL && Thread.currentCarrierThread() instanceof MpscCarrierThread ct
@@ -219,9 +276,10 @@ final class MpscVirtualThreadScheduler
         return carriers.length;
     }
 
+    /** The live carriers and the offload pool's threads. */
     @Override
     public int getPoolSize() {
-        int size = 0;
+        int size = (offloadPool != null) ? offloadPool.poolSize() : 0;
         for (MpscCarrierThread c : carriers) {
             if (c.isAlive()) {
                 size++;
@@ -231,12 +289,12 @@ final class MpscVirtualThreadScheduler
     }
 
     /**
-     * The live carriers that are not parked; one between tasks or polling is counted
-     * too, so this overestimates.
+     * The live carriers that are not parked and the offload pool's busy threads; a
+     * carrier between tasks or polling is counted too, so this overestimates.
      */
     @Override
     public int getMountedVirtualThreadCount() {
-        int count = 0;
+        int count = (offloadPool != null) ? offloadPool.busyCount() : 0;
         for (MpscCarrierThread c : carriers) {
             if (c.isAlive() && !c.isParked()) {
                 count++;

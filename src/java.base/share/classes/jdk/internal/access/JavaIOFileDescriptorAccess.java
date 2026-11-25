@@ -46,4 +46,13 @@ public interface JavaIOFileDescriptorAccess {
     // Only valid on Windows
     public void setHandle(FileDescriptor fdo, long handle);
     public long getHandle(FileDescriptor fdo);
+
+    // The kind of fdo's file: FS_LOCAL, a regular file on a local filesystem, or FS_OTHER
+    int FS_UNKNOWN = 0, FS_LOCAL = 1, FS_OTHER = 2;
+
+    // fdo's kind as cached, without a syscall: FS_UNKNOWN until fsClassify
+    public int fsKind(FileDescriptor fdo);
+
+    // Reads fdo's kind from the fd (fstatfs, fstat), caches it and returns it
+    public int fsClassify(FileDescriptor fdo);
 }

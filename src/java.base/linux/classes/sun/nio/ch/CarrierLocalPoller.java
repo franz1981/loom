@@ -102,11 +102,21 @@ final class CarrierLocalPoller implements LocalPoller {
             if (fd != eventfd.efd()) {
                 Thread vt = fdToThread.take(fd);
                 if (vt != null) {
-                    LockSupport.unpark(vt);
+                    unpark(vt);
                 }
             }
         }
         return n == MAX_EVENTS;
+    }
+
+    /**
+     * Unparks a thread whose fd is ready. An unpark that throws does not end the
+     * harvest: the other events of this poll are one-shot and would be lost.
+     */
+    private static void unpark(Thread vt) {
+        try {
+            LockSupport.unpark(vt);
+        } catch (Throwable e) { }
     }
 
     @Override

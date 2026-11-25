@@ -100,7 +100,8 @@ import jdk.internal.misc.Unsafe;
             long offset = mappingOffset(address, index);
             long mappingAddress = mappingAddress(address, offset, index);
             long mappingLength = mappingLength(offset, length);
-            boolean attempted = Blocker.begin();
+            // the mapping has no fd on Unix, so msync is never treated as local
+            boolean attempted = Blocker.beginDiskIO(null, true);
             try {
                 force0(fd, mappingAddress, mappingLength);
             } catch (IOException cause) {

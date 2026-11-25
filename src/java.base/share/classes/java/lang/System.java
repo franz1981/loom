@@ -62,6 +62,7 @@ import jdk.internal.javac.Restricted;
 import jdk.internal.loader.NativeLibraries;
 import jdk.internal.logger.LoggerFinderLoader.TemporaryLoggerFinder;
 import jdk.internal.misc.Blocker;
+import jdk.internal.misc.NoWaitWrite;
 import jdk.internal.misc.CarrierThreadLocal;
 import jdk.internal.util.StaticProperty;
 import jdk.internal.module.ModuleBootstrap;
@@ -1851,15 +1852,35 @@ public final class System {
     }
 
     /**
-     * System.in.
+     * System.in. On a BlockingCarrier, a read that sun.nio.ch.StreamProbe says would not
+     * wait is made with no section. The fd's kind is checked once, at the first such
+     * read; a later native dup2 keeps the stale kind.
      */
     private static class In extends FileInputStream {
+        // 0 until the first read on a BlockingCarrier, then 1 if its reads can be
+        // checked, 2 if not. Racy first reads store the same value
+        private int checks;
+
         In(FileDescriptor fd) {
             super(fd);
         }
 
+        private boolean readsNow() throws IOException {
+            if (!Blocker.tryNonBlockingFirst()) {
+                return false;
+            }
+            int c = checks;
+            if (c == 0) {
+                checks = c = sun.nio.ch.StreamProbe.checksReads(getFD()) ? 1 : 2;
+            }
+            return c == 1 && sun.nio.ch.StreamProbe.readable(getFD());
+        }
+
         @Override
         public int read() throws IOException {
+            if (readsNow()) {
+                return super.read();
+            }
             boolean attempted = Blocker.begin();
             try {
                 return super.read();
@@ -1870,6 +1891,9 @@ public final class System {
 
         @Override
         public int read(byte[] b) throws IOException {
+            if (readsNow()) {
+                return super.read(b);
+            }
             boolean attempted = Blocker.begin();
             try {
                 return super.read(b);
@@ -1880,6 +1904,9 @@ public final class System {
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
+            if (readsNow()) {
+                return super.read(b, off, len);
+            }
             boolean attempted = Blocker.begin();
             try {
                 return super.read(b, off, len);
@@ -1893,12 +1920,27 @@ public final class System {
      * System.out/System.err wrap this output stream.
      */
     private static class Out extends FileOutputStream {
+        private final NoWaitWrite noWait;
+
         Out(FileDescriptor fd) {
             super(fd);
+            noWait = new NoWaitWrite(fd, true);
         }
 
         @Override
         public void write(int b) throws IOException {
+            if (noWait.recorded()) {
+                noWait.writeRecorded(this, b);
+                return;
+            }
+            int n = noWait.write(b);
+            if (n == NoWaitWrite.PLAIN) {
+                super.write(b);
+                return;
+            }
+            if (n == 1) {
+                return;
+            }
             boolean attempted = Blocker.begin();
             try {
                 super.write(b);
@@ -1909,19 +1951,26 @@ public final class System {
 
         @Override
         public void write(byte[] b) throws IOException {
-            boolean attempted = Blocker.begin();
-            try {
-                super.write(b);
-            } finally {
-                Blocker.end(attempted);
-            }
+            write(b, 0, b.length);
         }
 
         @Override
         public void write(byte[] b, int off, int len) throws IOException {
+            if (noWait.recorded()) {
+                noWait.writeRecorded(this, b, off, len);
+                return;
+            }
+            int n = noWait.write(b, off, len);
+            if (n == NoWaitWrite.PLAIN) {
+                super.write(b, off, len);
+                return;
+            }
+            if (n == len && len > 0) {
+                return;
+            }
             boolean attempted = Blocker.begin();
             try {
-                super.write(b, off, len);
+                super.write(b, off + n, len - n);
             } finally {
                 Blocker.end(attempted);
             }
@@ -2321,6 +2370,22 @@ public final class System {
                 Thread thread = Thread.currentThread();
                 if (thread instanceof BaseVirtualThread vthread) {
                     vthread.parkNanos(nanos);
+                } else {
+                    throw new WrongThreadException();
+                }
+            }
+
+            public boolean tryParkVirtualThread(long nanos) {
+                Thread thread = Thread.currentThread();
+                if (thread instanceof VirtualThread vthread) {
+                    return vthread.tryPark(nanos);
+                } else if (thread instanceof BaseVirtualThread vthread) {
+                    if (nanos > 0) {
+                        vthread.parkNanos(nanos);
+                    } else {
+                        vthread.park();
+                    }
+                    return true;
                 } else {
                     throw new WrongThreadException();
                 }

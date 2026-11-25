@@ -30,6 +30,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
+import jdk.internal.misc.BlockingCarrier;
 import jdk.internal.vm.annotation.Contended;
 import sun.nio.ch.LocalPoller;
 
@@ -82,8 +83,13 @@ import static java.lang.MpscVirtualThreadScheduler.setHome;
  * <p>Memory order: enterParked's volatile store of PARKED, then the recheck's volatile
  * read of the producer index, pairs with submit's producer-index CAS, then its volatile
  * read of carrierState.
+ *
+ * <p>A carrier is a BlockingCarrier: a virtual thread that begins a Blocker section
+ * here moves to an offload pool thread for the section ({@link MpscOffloadPool}). It is
+ * then in no carrier's queue, and comes back home through its scheduler, as a wake from
+ * another thread.
  */
-final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
+final class MpscCarrierThread extends Thread implements LocalPoller.Carrier, BlockingCarrier {
     private static final VarHandle STATE;
     static {
         try {
@@ -120,9 +126,14 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     @Contended("local")
     private boolean unannounced;
 
-    MpscCarrierThread(int id, MpscVirtualThreadScheduler scheduler, IdleSet idleSet,
-                      SearchGate gate, LocalPoller poller) {
-        super(null, null, "mpsc-carrier-" + id, 0, false);
+    // a pinned thread's Blocker section runs here: set at its begin, cleared at its end,
+    // and no other thread runs here in between
+    @Contended("local")
+    private boolean pinnedSection;
+
+    MpscCarrierThread(ThreadGroup group, int id, MpscVirtualThreadScheduler scheduler,
+                      IdleSet idleSet, SearchGate gate, LocalPoller poller) {
+        super(group, null, "mpsc-carrier-" + id, 0, false);
         this.id = id;
         this.scheduler = scheduler;
         this.idleSet = idleSet;
@@ -176,7 +187,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private void enterParked() {
         carrierState = PARKED;
         if (STEAL) {
-            idleSet.setIdle(this);
+            idleSet.setIdle(id);
         }
     }
 
@@ -184,7 +195,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private void leaveParked() {
         int prev = (int) STATE.getAndSet(this, RUNNING);
         if (STEAL) {
-            idleSet.clearIdle(this);
+            idleSet.clearIdle(id);
             if (prev == WAKING) {
                 announceBacklog(false);
             } else if (prev >= SEARCHING) {
@@ -197,7 +208,7 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     private void abortPark() {
         int prev = (int) STATE.getAndSet(this, RUNNING);
         if (STEAL) {
-            idleSet.clearIdle(this);
+            idleSet.clearIdle(id);
             if (prev == WAKING) {
                 announceBacklog(true);
             } else if (prev >= SEARCHING) {
@@ -261,6 +272,54 @@ final class MpscCarrierThread extends Thread implements LocalPoller.Carrier {
     @Override
     public LocalPoller localPoller() {
         return poller;
+    }
+
+    // ---- Blocker sections ----
+
+    /**
+     * Invoked by the virtual thread mounted here as it begins a Blocker section: sets
+     * its task's offload hint and yields, and the scheduler's onContinue, on this
+     * carrier, hands the unmounted thread to the offload pool. Returns false, with no
+     * yield, if the pool has no thread to give or the thread is a custom scheduler's:
+     * the section runs here. A hint still set after the yield means the thread could
+     * not unmount (pinned): the section runs here and endBlocking reports it. This
+     * relies on Thread.yield() always trying to unmount. An OutOfMemoryError from the
+     * yield propagates, as a failed compensation does on a CarrierThread.
+     */
+    @Override
+    public boolean beginBlocking() {
+        MpscOffloadPool pool = scheduler.offloadPool();
+        if (pool == null || !pool.mayTake()
+                || !(((VirtualThread) Thread.currentThread()).virtualThreadTask()
+                        instanceof MpscVirtualThreadScheduler.MpscTask task)) {
+            return false;
+        }
+        boolean stayed;
+        task.offload = true;
+        try {
+            Thread.yield();
+        } finally {
+            stayed = task.offload;
+            task.offload = false;
+        }
+        if (stayed) {
+            pinnedSection = true;
+        }
+        return true;
+    }
+
+    /**
+     * Invoked when a section ends on this carrier. A section a pinned thread ran here is
+     * recorded as a jdk.VirtualThreadPinned event, from the failed yield to now. Any
+     * other thread is back on a carrier after its yield at the begin (no pool thread
+     * took it, or it was woken onto a carrier from its pool thread): nothing to undo.
+     */
+    @Override
+    public void endBlocking() {
+        if (pinnedSection) {
+            pinnedSection = false;
+            VirtualThread.postPinnedEvent("Blocking operation");
+        }
     }
 
     // ---- The carrier's own loops ----

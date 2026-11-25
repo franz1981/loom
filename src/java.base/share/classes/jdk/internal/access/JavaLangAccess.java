@@ -613,6 +613,16 @@ public interface JavaLangAccess {
     void parkVirtualThread(long nanos);
 
     /**
+     * Parks the current virtual thread as {@link #parkVirtualThread()} (nanos <= 0) or
+     * {@link #parkVirtualThread(long)} do, if it can unmount. If it cannot (it is
+     * pinned) it does not park, and returns false: the caller then waits some other way.
+     * @param nanos the maximum number of nanoseconds to wait, or <= 0 for no limit
+     * @return false if the thread did not park because it could not unmount
+     * @throws WrongThreadException if the current thread is not a virtual thread
+     */
+    boolean tryParkVirtualThread(long nanos);
+
+    /**
      * Re-enables a virtual thread for scheduling. If the thread is parked then it will
      * be scheduled to continue, otherwise its next attempt to park will not block.
      * @param thread the virtual thread to unpark

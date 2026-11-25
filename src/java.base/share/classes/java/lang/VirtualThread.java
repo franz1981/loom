@@ -117,6 +117,7 @@ final class VirtualThread extends BaseVirtualThread {
      * UNPARKED -> RUNNING         // continue execution after park
      *
      *  PARKING -> RUNNING         // cont.yield failed, need to park on carrier
+     *                             // (tryPark: the caller waits another way)
      *  RUNNING -> PINNED          // park on carrier
      *   PINNED -> RUNNING         // unparked, continue execution on same carrier
      *
@@ -125,6 +126,7 @@ final class VirtualThread extends BaseVirtualThread {
      *  TIMED_PARKED -> UNPARKED        // unparked, may be scheduled to continue
      *
      * TIMED_PARKING -> RUNNING         // cont.yield failed, need to park on carrier
+     *                                  // (tryPark: the caller waits another way)
      *       RUNNING -> TIMED_PINNED    // park on carrier
      *  TIMED_PINNED -> RUNNING         // unparked, continue execution on same carrier
      *
@@ -884,6 +886,41 @@ final class VirtualThread extends BaseVirtualThread {
     }
 
     /**
+     * Parks as {@link #park()} (nanos <= 0) or {@link #parkNanos(long)} do when this
+     * thread can unmount. If it cannot (pinned, or an OutOfMemoryError when yielding),
+     * it does not park on its carrier: it returns false, with the permit and the
+     * interrupt status untouched, for the caller to wait another way.
+     * @return false if the thread did not park because it could not unmount
+     */
+    boolean tryPark(long nanos) {
+        assert Thread.currentThread() == this;
+
+        // complete immediately if parking permit available or interrupted
+        if (getAndSetParkPermit(false) || interrupted)
+            return true;
+
+        boolean yielded = false;
+        if (nanos > 0) {
+            timeout = nanos;
+            setState(TIMED_PARKING);
+        } else {
+            setState(PARKING);
+        }
+        try {
+            yielded = yieldContinuation();
+        } catch (OutOfMemoryError e) {
+            // not parked
+        } finally {
+            assert (Thread.currentThread() == this) && (yielded == (state() == RUNNING));
+            if (!yielded) {
+                assert state() == ((nanos > 0) ? TIMED_PARKING : PARKING);
+                setState(RUNNING);
+            }
+        }
+        return yielded;
+    }
+
+    /**
      * Parks up to the given waiting time or until unparked or interrupted.
      * If already unparked then the parking permit is consumed and this method
      * completes immediately (meaning it doesn't yield). It also completes immediately
@@ -963,7 +1000,7 @@ final class VirtualThread extends BaseVirtualThread {
      * with the same name, but different ID, to events recorded by the VM.
      */
     @Hidden
-    private static native void postPinnedEvent(String op);
+    static native void postPinnedEvent(String op);
 
     /**
      * Re-enables this virtual thread for scheduling. If this virtual thread is parked
@@ -1497,7 +1534,7 @@ final class VirtualThread extends BaseVirtualThread {
         }
         if (Boolean.getBoolean("jdk.virtualThreadScheduler.useMpsc")) {
             System.err.println("WARNING: Using experimental MPSC virtual thread scheduler");
-            return new MpscVirtualThreadScheduler(parallelism);
+            return new MpscVirtualThreadScheduler(parallelism, maxPoolSize);
         }
         ForkJoinWorkerThreadFactory factory;
         if (wrapped) {
